@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync/atomic"
 )
 
 // Palette holds all colours used by the interface.
@@ -99,14 +100,16 @@ func Get(name string) Palette {
 
 // colorProfile degrades gracefully: we always emit 24-bit colour, and terminals
 // that lack support will simply clamp.
-var trueColorSupported = true
+var trueColorSupported atomic.Bool
+
+func init() { trueColorSupported.Store(true) }
 
 // SetTrueColor overrides colour capability (used by --no-color).
-func SetTrueColor(v bool) { trueColorSupported = v }
+func SetTrueColor(v bool) { trueColorSupported.Store(v) }
 
 // fg renders s in the given hex colour.
 func fg(hex, s string) string {
-	if !trueColorSupported {
+	if !trueColorSupported.Load() {
 		return s
 	}
 	r, g, b := hexRGB(hex)
@@ -118,7 +121,7 @@ func fg(hex, s string) string {
 
 // bg renders s on the given hex background.
 func bg(hex, s string) string {
-	if !trueColorSupported {
+	if !trueColorSupported.Load() {
 		return s
 	}
 	r, g, b := hexRGB(hex)
@@ -130,7 +133,7 @@ func bg(hex, s string) string {
 
 // fgBold renders s bold in the given colour.
 func fgBold(hex, s string) string {
-	if !trueColorSupported {
+	if !trueColorSupported.Load() {
 		return s
 	}
 	return "\x1b[1m" + fg(hex, s)

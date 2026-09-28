@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/nova-ai/nova/internal/agent"
 	"github.com/nova-ai/nova/internal/config"
@@ -27,6 +28,13 @@ import (
 // level can spawn the next: without it, one confused instruction produces a
 // tree of agents and the bill is the user's.
 const MaxDepth = 1
+
+// maxReplyChars bounds what a subagent hands back to its parent. The parent's
+// context is finite, and a subagent that narrates before each of its tool
+// calls can produce far more text than a conclusion needs, so the tail is
+// dropped with a marker instead of flooding the conversation it was called to
+// summarise.
+const maxReplyChars = 20000
 
 // Result is what a finished subagent reports back to its parent.
 type Result struct {
@@ -60,8 +68,7 @@ type Spawn struct {
 }
 
 // Runner builds and runs subagents. It carries what a subagent cannot get on
-// its own: the session config, the workspace it is confined to, and the
-// approval policy that still applies to its tool calls.
+// its own: the session config and the workspace it is confined to.
 type Runner struct {
 	// Config resolves models and the generation settings.
 	Config *config.Config
@@ -69,9 +76,6 @@ type Runner struct {
 	// deliberately the parent's workspace: a subagent works on the same files
 	// the user is looking at.
 	Workspace string
-	// Confirm is the approval policy, so a risky command inside a subagent
-	// asks the user exactly as it would in the main agent.
-	Confirm func(tool string, args map[string]any) bool
 	// OnEvent receives a line whenever a subagent starts, calls a tool or
 	// finishes. It is how the parent — and the user — learn what the child is
 	// doing, since the child has no UI of its own.
@@ -242,11 +246,27 @@ func (r *Runner) Run(ctx context.Context, sp Spawn) Result {
 		return fail(fmt.Errorf("subagent: %w", err))
 	}
 
+	budget := profile.budget
+	if r.MaxToolCalls > 0 && r.MaxToolCalls < budget {
+		budget = r.MaxToolCalls
+	}
+
+	var (
+		mu         sync.Mutex
+		toolCalls  int
+		overBudget bool
+		reply      strings.Builder
+	)
+
 	// The subagent gets its own registry holding only the role's tools, so a
 	// tool the role excludes is not merely discouraged — it is absent from the
 	// request the model sees, and the task tool that started this is not among
 	// them, so the child cannot fan out further.
-	reg := tools.NewRegistry(r.Confirm)
+	//
+	// The call budget is enforced from the event sink below rather than by
+	// gating the registry, since the registry no longer asks permission for
+	// anything: a spent budget cancels the run at its next checkpoint.
+	reg := tools.NewRegistry()
 	for _, toolName := range profile.tools {
 		if tool, ok := tools.New(toolName); ok {
 			reg.Register(tool)
@@ -257,16 +277,13 @@ func (r *Runner) Run(ctx context.Context, sp Spawn) Result {
 	}
 	reg.ReadOnly = profile.readOnly
 
-	budget := profile.budget
-	if r.MaxToolCalls > 0 && r.MaxToolCalls < budget {
-		budget = r.MaxToolCalls
-	}
-
-	var (
-		mu        sync.Mutex
-		toolCalls int
-		reply     strings.Builder
-	)
+	// The run ends in exactly one of three ways, and the parent needs a
+	// usable answer in all three: the task done, the task refused, or the
+	// budget hit mid-way. Cancelling this context is what the main agent does
+	// to a running turn, so a stopped parent stops its children too, and it is
+	// also how a child that has spent its budget stops itself.
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	emit(EvSubStart, fmt.Sprintf("%s · %s", name, model.ID), "")
 
@@ -279,9 +296,10 @@ func (r *Runner) Run(ctx context.Context, sp Spawn) Result {
 		PlanMode:  reg.ReadOnly,
 		// One iteration per tool call, plus one for the final answer: the loop
 		// spends an iteration on the reply that asks for a tool and another on
-		// the reply that does not.
+		// the reply that does not. This is the backstop, not the cap — a model
+		// that asks for several tools in one reply would get budget × calls
+		// out of it, so the tool count below is what actually stops the run.
 		MaxIterations: budget + 1,
-		Confirmation:  r.Confirm,
 		EventSink: func(ev agent.Event) {
 			switch ev.Kind {
 			case agent.EvText:
@@ -291,8 +309,20 @@ func (r *Runner) Run(ctx context.Context, sp Spawn) Result {
 			case agent.EvToolStart:
 				mu.Lock()
 				toolCalls++
+				spent := toolCalls > budget
+				if spent {
+					overBudget = true
+				}
 				mu.Unlock()
 				emit(EvSubTool, md.FormatBrief(ev.Tool, ev.Args), ev.Tool)
+				if spent {
+					// The turn stops at its next checkpoint. The budget is
+					// counted in tool calls because that is what the role was
+					// granted and what the parent is billed for; without this
+					// the cap would only bound model turns, and one reply
+					// asking for ten tools would spend ten budgets.
+					cancel()
+				}
 			case agent.EvToolResult:
 				if ev.IsErr {
 					emit(EvSubTool, ev.Tool+" failed: "+firstLine(ev.Output), ev.Tool)
@@ -304,27 +334,25 @@ func (r *Runner) Run(ctx context.Context, sp Spawn) Result {
 		return fail(err)
 	}
 
-	// The run ends in exactly one of three ways, and the parent needs a
-	// usable answer in all three: the task done, the task refused, or the
-	// depth cap hit mid-way. Cancelling the context is what the main agent
-	// does to a running turn, so a stopped parent stops its children too.
-	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
 	runErr := sub.RunTask(runCtx, task)
 
 	mu.Lock()
 	res := Result{
-		Reply:    strings.TrimSpace(reply.String()),
+		Reply:    boundReply(reply.String()),
 		Tools:    toolCalls,
 		Usage:    sub.Usage(),
 		Duration: time.Since(start),
 	}
+	spent := overBudget
 	mu.Unlock()
 
 	if runErr != nil {
-		res.Err = runErr
-		emit(EvSubFail, runErr.Error(), "")
+		if spent {
+			res.Err = fmt.Errorf("subagent %q used its whole budget of %d tool calls", name, budget)
+		} else {
+			res.Err = runErr
+		}
+		emit(EvSubFail, res.Err.Error(), "")
 		return res
 	}
 	if res.Reply == "" {
@@ -345,6 +373,20 @@ func plural(n int) string {
 		return ""
 	}
 	return "s"
+}
+
+// boundReply trims a subagent's answer to what a parent can hold in its
+// context, never cutting a UTF-8 rune in half.
+func boundReply(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= maxReplyChars {
+		return s
+	}
+	cut := s[:maxReplyChars]
+	for len(cut) > 0 && !utf8.RuneStart(cut[len(cut)-1]) {
+		cut = cut[:len(cut)-1]
+	}
+	return fmt.Sprintf("%s\n... truncated at %d chars", cut, maxReplyChars)
 }
 
 func firstLine(s string) string {

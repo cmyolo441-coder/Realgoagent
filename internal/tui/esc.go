@@ -4,11 +4,12 @@ package tui
 //
 //  1. a turn in flight is stopped
 //  2. an open overlay — model picker, then command palette — closes
-//  3. the composer is cleared
+//  3. the live diff panel is dismissed
+//  4. the composer is cleared
 //
-// While the agent is blocked on a question or an approval, Esc is ignored:
-// answering "no" is the way out of that, and silently cancelling it would let
-// a pending tool call look abandoned.
+// While the agent is blocked on a question, Esc is ignored: an unanswered
+// question would otherwise look abandoned.
+// handleEsc is called with t.mu held (from onKey).
 func (t *TUI) handleEsc() {
 	switch {
 	case t.streaming:
@@ -36,6 +37,11 @@ func (t *TUI) handleEsc() {
 		t.closeModelPicker()
 	case t.paletteLen() > 0:
 		t.dismissPalette()
+	case t.liveDiffOpen():
+		// The panel is the one thing Esc is advertised to close, and it is up
+		// from the first edit onwards, so it is answered before the composer:
+		// a second Esc then clears the prompt.
+		t.liveDiff.close()
 	case !t.composerEmpty():
 		t.inputLines = []string{""}
 		t.cursorLine, t.cursorCol = 0, 0

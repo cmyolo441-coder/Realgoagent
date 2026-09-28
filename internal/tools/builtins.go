@@ -11,6 +11,12 @@ import (
 	"time"
 )
 
+// maxFileBytes bounds one file that a path tool will pull into memory. The
+// path comes from the model, so an unbounded os.ReadFile is a way to end the
+// process: a multi-gigabyte log answers a one-line tool call with an
+// out-of-memory kill.
+const maxFileBytes = 16 << 20
+
 // ---- read ----
 
 type readTool struct{}
@@ -21,7 +27,7 @@ func (readTool) Description() string {
 }
 func (readTool) Schema() map[string]any {
 	return obj(
-		req("path", "Path to the file, relative to the workspace or absolute"),
+		req("path", "Path to the file, relative to the workspace. Paths outside the workspace are refused."),
 		prop("offset", "integer", "1-based line number to start reading from"),
 		prop("limit", "integer", "Maximum number of lines to return"),
 	)
@@ -41,6 +47,10 @@ func (readTool) Run(ctx context.Context, a map[string]any) *Result {
 	}
 	if info.IsDir() {
 		return errResult("read: %s is a directory; use list_dir", p)
+	}
+	if info.Size() > maxFileBytes {
+		return errResult("read: %s is %s, past the %s limit for a single call; use bash (sed -n '1,400p' %s) or grep to work through it",
+			p, humanSize(info.Size()), humanSize(maxFileBytes), shellQuote(full))
 	}
 	data, err := os.ReadFile(full)
 	if err != nil {
@@ -93,9 +103,15 @@ func (writeTool) Schema() map[string]any {
 }
 func (writeTool) Run(ctx context.Context, a map[string]any) *Result {
 	p, _ := argString(a, "path")
-	c, _ := argString(a, "content")
+	c, hasContent := argString(a, "content")
 	if p == "" {
 		return errResult("write: 'path' is required")
+	}
+	if !hasContent {
+		// An absent argument is not an empty file. Treating it as one
+		// truncates whatever was on disk and then reports a successful write,
+		// so a model that simply forgot the content loses the file.
+		return errResult("write: 'content' is required (pass an empty string to create an empty file)")
 	}
 	full, err := resolvePath(p)
 	if err != nil {
@@ -136,9 +152,15 @@ func (editTool) Schema() map[string]any {
 func (editTool) Run(ctx context.Context, a map[string]any) *Result {
 	p, _ := argString(a, "path")
 	old, _ := argString(a, "old_string")
-	nw, _ := argString(a, "new_string")
+	nw, hasNew := argString(a, "new_string")
 	if p == "" || old == "" {
 		return errResult("edit: 'path' and 'old_string' are required")
+	}
+	if !hasNew {
+		// An absent new_string means "delete the match", which is a real edit
+		// but never an intended one, and it happens whenever the model drops
+		// the argument. Say so instead of quietly emptying the text.
+		return errResult("edit: 'new_string' is required (pass an empty string to delete the matched text)")
 	}
 	full, err := resolvePath(p)
 	if err != nil {
@@ -214,9 +236,12 @@ func (multiEditTool) Run(ctx context.Context, a map[string]any) *Result {
 			return errResult("multi_edit: entry %d is not an object", i)
 		}
 		old, _ := m["old_string"].(string)
-		nw, _ := m["new_string"].(string)
+		nw, hasNew := m["new_string"].(string)
 		if old == "" {
 			return errResult("multi_edit: entry %d has empty old_string", i)
+		}
+		if !hasNew {
+			return errResult("multi_edit: entry %d has no new_string", i)
 		}
 		if strings.Count(content, old) != 1 {
 			return errResult("multi_edit: entry %d old_string not uniquely found in %s", i, p)
@@ -260,7 +285,7 @@ func (bashTool) Run(ctx context.Context, a map[string]any) *Result {
 	if ms < 1000 {
 		ms = 1000
 	}
-	out, _, err := runInDir(cmd, workspace(), time.Duration(ms)*time.Millisecond)
+	out, _, err := runInDir(ctx, cmd, workspace(), time.Duration(ms)*time.Millisecond)
 	res := &Result{Output: out}
 	if err != nil {
 		res.IsError = true
@@ -483,6 +508,19 @@ func (grepTool) Run(ctx context.Context, a map[string]any) *Result {
 			}
 			return nil
 		}
+		if d.Type()&fs.ModeSymlink != 0 {
+			// A link sitting in the workspace can point at anything, and
+			// reading through it turns grep into a reader for the whole disk
+			// without ever leaving the directory the model named. The walk
+			// already refuses to descend through links; this is the same rule
+			// for the leaf.
+			return nil
+		}
+		if info, ierr := d.Info(); ierr == nil && info.Size() > maxFileBytes {
+			// Same reason read refuses one: the contents of a build artefact
+			// or a data dump would be pulled into memory whole, per file.
+			return nil
+		}
 		if gl != "" {
 			if ok, _ := filepath.Match(gl, d.Name()); !ok {
 				return nil
@@ -537,16 +575,29 @@ func (patchTool) Run(ctx context.Context, a map[string]any) *Result {
 	if diff == "" {
 		return errResult("patch: 'patch' is required")
 	}
-	tmp := filepath.Join(os.TempDir(), fmt.Sprintf("nova-patch-%d.diff", time.Now().UnixNano()))
-	if err := os.WriteFile(tmp, []byte(diff), 0o644); err != nil {
+	tmp, err := os.CreateTemp("", "nova-patch-*.diff")
+	if err != nil {
 		return errResult("patch: %v", err)
 	}
-	defer os.Remove(tmp)
-	out, _, err := runInDir("patch -p1 --dry-run < "+shellQuote(tmp), workspace(), 30*time.Second)
+	// A named file in a shared temp directory is a target for anyone on the
+	// box: the name was predictable, so a pre-planted symlink turned this
+	// write into an overwrite of a file of their choosing, and the mode let
+	// the diff (workspace text) be read by every other user. CreateTemp is
+	// O_EXCL, random and 0600.
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.WriteString(diff); err != nil {
+		tmp.Close()
+		return errResult("patch: %v", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return errResult("patch: %v", err)
+	}
+	name := tmp.Name()
+	out, _, err := runInDir(ctx, "patch -p1 --dry-run < "+shellQuote(name), workspace(), 30*time.Second)
 	if err != nil {
 		return errResult("patch: dry-run failed:\n%s\n%s", out, err)
 	}
-	out, _, err = runInDir("patch -p1 < "+shellQuote(tmp), workspace(), 30*time.Second)
+	out, _, err = runInDir(ctx, "patch -p1 < "+shellQuote(name), workspace(), 30*time.Second)
 	if err != nil {
 		return &Result{Output: fmt.Sprintf("patch apply failed:\n%s\n%v", out, err), IsError: true}
 	}

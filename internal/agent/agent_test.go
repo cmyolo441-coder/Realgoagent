@@ -31,7 +31,7 @@ func newTestAgent(t *testing.T, handler http.HandlerFunc) (*Agent, func() []Even
 		Config:   cfg,
 		Provider: prov,
 		Model:    model,
-		Registry: tools.NewRegistry(func(string, map[string]any) bool { return true }),
+		Registry: tools.NewRegistry(),
 		EventSink: func(e Event) {
 			mu.Lock()
 			events = append(events, e)

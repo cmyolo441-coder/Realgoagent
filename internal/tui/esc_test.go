@@ -1,6 +1,10 @@
 package tui
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/nova-ai/nova/internal/editdiff"
+)
 
 func escTUI(lines ...string) *TUI {
 	if len(lines) == 0 {
@@ -9,6 +13,7 @@ func escTUI(lines ...string) *TUI {
 	return &TUI{
 		app:        &App{history: NewBuffer(100)},
 		inputLines: lines,
+		liveDiff:   newLiveDiffView(),
 	}
 }
 
@@ -73,9 +78,9 @@ func TestPaletteReopensAfterDismissalOnNewInput(t *testing.T) {
 	}
 }
 
-// While the agent waits on a question or an approval, Esc is ignored: the way
-// out of that is to answer, and cancelling it silently would strand a tool
-// call that still needs a decision.
+// While the agent waits on a question, Esc is ignored: the way out of that is
+// to answer, and cancelling it silently would strand a tool call that still
+// needs a decision.
 func TestEscIgnoredWhileAsking(t *testing.T) {
 	tui := escTUI("draft answer")
 	tui.asking = true
@@ -87,6 +92,35 @@ func TestEscIgnoredWhileAsking(t *testing.T) {
 	}
 	if tui.inputLines[0] != "draft answer" {
 		t.Errorf("composer = %q, want it untouched while asking", tui.inputLines[0])
+	}
+}
+
+// Esc is advertised to close the live diff panel, and the panel is up from the
+// first edit onwards. It has to be answered before the composer, or Esc clears
+// a half-typed prompt and leaves the panel on screen saying the opposite.
+func TestEscDismissesLiveDiffThenClearsComposer(t *testing.T) {
+	tui := escTUI("a half-typed prompt")
+	tui.app.edits = newEditLog()
+	tui.app.edits.record("edit", "1s", "", false, []editdiff.FileDiff{{
+		Path:   "main.go",
+		Before: "package main\n",
+		After:  "package main\n\nfunc main() {}\n",
+	}})
+	if !tui.liveDiffOpen() {
+		t.Fatal("the panel should be open after an edit")
+	}
+
+	tui.handleEsc()
+	if tui.liveDiffOpen() {
+		t.Error("Esc should have dismissed the live diff panel")
+	}
+	if tui.inputLines[0] != "a half-typed prompt" {
+		t.Errorf("composer = %q, want the text kept", tui.inputLines[0])
+	}
+
+	tui.handleEsc()
+	if tui.inputLines[0] != "" {
+		t.Errorf("composer = %q, want the second Esc to clear it", tui.inputLines[0])
 	}
 }
 

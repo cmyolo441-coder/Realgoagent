@@ -48,8 +48,31 @@ func TestResolveModel(t *testing.T) {
 	// substring match
 	if _, m, err := c.ResolveModel("mimo"); err != nil {
 		t.Fatal(err)
-	} else if m.ID != "xiaomi-mimo-v2.6-pro-free" {
+	} else if m.ID != "mimo-v2.6-flash" {
 		t.Errorf("substring resolved to %s", m.ID)
+	}
+
+	// the two models added to kiosai resolve by id and by alias
+	for _, ref := range []string{"longcat-2.5-preview", "longcat", "mimo-v2.6-flash"} {
+		p, m, err := c.ResolveModel(ref)
+		if err != nil {
+			t.Errorf("ResolveModel(%q): %v", ref, err)
+			continue
+		}
+		if p.Name != "kiosai" {
+			t.Errorf("ResolveModel(%q) provider = %s, want kiosai", ref, p.Name)
+		}
+		if m.MaxOut <= 0 {
+			t.Errorf("kiosai/%s has no max_output", m.ID)
+		}
+	}
+
+	// inferera was removed, so nothing of it resolves any more
+	if _, _, err := c.ResolveModel("inferera/union-alpha-free"); err == nil {
+		t.Error("expected error for removed provider inferera")
+	}
+	if _, _, err := c.ResolveModel("union"); err == nil {
+		t.Error("expected error for removed inferera model union")
 	}
 
 	if _, _, err := c.ResolveModel("nope"); err == nil {
@@ -62,7 +85,7 @@ func TestResolveModel(t *testing.T) {
 
 func TestDefaultHasAllProviders(t *testing.T) {
 	c := Default()
-	want := []string{"kiosai", "inferera", "stepfun"}
+	want := []string{"kiosai", "stepfun"}
 	if len(c.Providers) != len(want) {
 		t.Fatalf("want %d providers, got %d", len(want), len(c.Providers))
 	}
@@ -74,9 +97,79 @@ func TestDefaultHasAllProviders(t *testing.T) {
 			t.Errorf("provider %s should be enabled", name)
 		}
 	}
-	// kios models
-	if len(c.Providers[0].Models) != 4 {
-		t.Errorf("kiosai should have 4 models, got %d", len(c.Providers[0].Models))
+	// kios models: the original four plus longcat-2.5-preview and mimo-v2.6-flash
+	if len(c.Providers[0].Models) != 6 {
+		t.Errorf("kiosai should have 6 models, got %d", len(c.Providers[0].Models))
+	}
+	for _, m := range c.Providers[0].Models {
+		if m.MaxOut <= 0 {
+			t.Errorf("kiosai/%s has no max_output", m.ID)
+		}
+		if m.Context <= m.MaxOut {
+			t.Errorf("kiosai/%s context %d must exceed its output limit %d",
+				m.ID, m.Context, m.MaxOut)
+		}
+	}
+}
+
+func TestMaxOutputTokens(t *testing.T) {
+	c := Default()
+
+	_, m, err := c.ResolveModel("kiosai/grok-4.7-free")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A short prompt leaves the model's own limit untouched: the agent asks for
+	// everything the model can produce.
+	if got, want := c.MaxOutputTokens(m, 2000), m.MaxOut; got != want {
+		t.Errorf("short prompt = %d, want the full %d", got, want)
+	}
+
+	// A prompt that fills the window squeezes the completion down, and the
+	// budget it leaves plus the prompt still fits inside the context.
+	got := c.MaxOutputTokens(m, m.Context-1000)
+	if got >= m.MaxOut {
+		t.Errorf("long prompt = %d, want less than the full %d", got, m.MaxOut)
+	}
+	if got > 1000 {
+		t.Errorf("long prompt = %d, want at most the 1000 tokens left", got)
+	}
+
+	// A prompt larger than the whole window still yields a positive budget
+	// rather than a negative one the server would reject as malformed.
+	if got := c.MaxOutputTokens(m, m.Context*2); got < 1 {
+		t.Errorf("oversized prompt = %d, want a positive budget", got)
+	}
+
+	// A positive Config.MaxTokens caps every model...
+	c.MaxTokens = 4096
+	if got := c.MaxOutputTokens(m, 2000); got != 4096 {
+		t.Errorf("capped = %d, want 4096", got)
+	}
+	// ...and the context window still wins over the cap.
+	if got := c.MaxOutputTokens(m, m.Context-1000); got > 4096 {
+		t.Errorf("capped long prompt = %d, want at most 4096", got)
+	}
+
+	// A model that declares no output limit falls back to the default, once the
+	// global cap above is lifted again.
+	c.MaxTokens = 0
+	plain := &Model{Context: 200000}
+	if got, want := c.MaxOutputTokens(plain, 1000), defaultMaxOutput; got != want {
+		t.Errorf("undeclared limit = %d, want %d", got, want)
+	}
+}
+
+func TestEstimateTokens(t *testing.T) {
+	if got := EstimateTokens(""); got != 0 {
+		t.Errorf("empty = %d, want 0", got)
+	}
+	if got := EstimateTokens("abcd"); got != 1 {
+		t.Errorf("4 chars = %d, want 1", got)
+	}
+	if got := EstimateTokens("abcde"); got != 2 {
+		t.Errorf("5 chars = %d, want 2", got)
 	}
 }
 
@@ -120,7 +213,7 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	if back.Theme != "dracula" {
 		t.Errorf("theme = %q", back.Theme)
 	}
-	if len(back.Providers) != 3 {
+	if len(back.Providers) != 2 {
 		t.Errorf("providers = %d", len(back.Providers))
 	}
 }

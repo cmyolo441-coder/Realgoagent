@@ -17,6 +17,8 @@ func (t *TUI) panelRows(p theme.Palette, w, budget int) []string {
 		return t.subViewRows(p, w, budget)
 	case t.editViewerOpen():
 		return t.editViewerRows(p, w, budget)
+	case t.liveDiffOpen():
+		return t.liveDiffRows(p, w, budget)
 	case t.modelPickerOpen():
 		// The picker takes the space it needs; the command palette is not
 		// useful at the same time.

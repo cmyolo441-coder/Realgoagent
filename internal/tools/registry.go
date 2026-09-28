@@ -4,12 +4,12 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"sort"
 	"strings"
@@ -34,18 +34,19 @@ type Tool interface {
 }
 
 // Registry holds all available tools and dispatches calls.
+//
+// Tool calls are not gated. A registered tool runs when the agent calls it, so
+// the only restriction left is ReadOnly, which is how plan mode works.
 type Registry struct {
 	mu    sync.RWMutex
 	tools map[string]Tool
 	// ReadOnly rejects any tool that would mutate the workspace (plan mode).
 	ReadOnly bool
-	// Confirmation gates mutating or risky operations.
-	Confirm func(tool string, args map[string]any) bool
 }
 
-// NewRegistry returns a registry seeded with an approval callback.
-func NewRegistry(confirm func(string, map[string]any) bool) *Registry {
-	return &Registry{tools: map[string]Tool{}, Confirm: confirm}
+// NewRegistry returns a registry ready for tools to be registered.
+func NewRegistry() *Registry {
+	return &Registry{tools: map[string]Tool{}}
 }
 
 // Register adds a tool to the registry.
@@ -135,23 +136,31 @@ func (r *Registry) Call(ctx context.Context, name string, rawArgs string) (res *
 
 	if !r.allowed(name) {
 		return &Result{
-			Output:   fmt.Sprintf("%s is disabled in plan mode (read-only). Ask the user for permission or switch modes.", name),
+			Output:   fmt.Sprintf("%s is disabled in plan mode (read-only). Switch to agent mode to run it.", name),
 			IsError:  true,
 			Duration: time.Since(start),
 		}
-	}
-
-	if r.Confirm != nil && !r.Confirm(name, args) {
-		return &Result{Output: "user denied this tool call", IsError: true, Duration: time.Since(start)}
 	}
 
 	// Snapshot the files this call is about to touch so the edit watcher can
 	// show the change the moment it lands. Read-only tools snapshot nothing,
 	// so this costs one map allocation per tool call and nothing else.
 	before := beginEdit(touchPaths(name, rawArgs))
+	finished := false
+	// beginEdit takes the watcher's lock and finishEdit is what releases it.
+	// The recover above catches a panicking tool, so without this the lock
+	// would be stranded and every later edit would block in beginEdit for
+	// good: one broken tool turning into a hung session. Passing nil releases
+	// the lock without reporting a change the tool may never have made.
+	defer func() {
+		if !finished {
+			finishEdit(nil, name, "", "", true)
+		}
+	}()
 	res = t.Run(ctx, args)
 	res.Duration = time.Since(start)
 	finishEdit(before, name, formatDur(res.Duration), res.Output, res.IsError)
+	finished = true
 	return res
 }
 
@@ -191,7 +200,8 @@ func normalizeArgs(s string) (map[string]any, error) {
 
 func argString(args map[string]any, key string) (string, bool) {
 	v, ok := args[key]
-	if !ok {
+	if !ok || v == nil {
+		// A JSON null is an absent argument, not the text "<nil>".
 		return "", false
 	}
 	switch t := v.(type) {
@@ -273,29 +283,139 @@ func GetShell() string {
 	return shell
 }
 
-// resolvePath clamps a path inside the workspace unless it is absolute.
-// Absolute paths are honoured so the agent can read system files, but a
-// relative path may not climb out with "..".
+// resolvePath maps a path the model asked for onto a real path and refuses
+// anything that lands outside the workspace.
+//
+// An absolute path reaches the same place a relative one reaches with "..", so
+// both are checked here: `read /etc/shadow` is the same escape as
+// `read ../../etc/shadow`, and a tool that honours the first spelling is no
+// more confined than one that ignores the second. Symlinks are resolved
+// before the check so a link planted inside the workspace is not a second way
+// out of it.
+//
+// What comes back is the cleaned path the caller asked for, so error messages
+// and results keep the spelling the model used.
 func resolvePath(p string) (string, error) {
 	if p == "" {
 		return "", fmt.Errorf("empty path")
 	}
-	if filepath.IsAbs(p) {
-		return filepath.Clean(p), nil
-	}
 	root := workspace()
-	full := filepath.Join(root, filepath.FromSlash(p))
-	if root != "" {
-		rel, err := filepath.Rel(root, full)
-		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			return "", fmt.Errorf("path %q escapes the workspace root %q", p, root)
+	if root == "" {
+		// Joining onto an empty root resolves against the process working
+		// directory with no confinement at all. Anchor on it explicitly so
+		// the containment check below still has something to compare against.
+		wd, err := os.Getwd()
+		if err != nil {
+			return "", fmt.Errorf("no workspace root is set: %v", err)
 		}
+		root = wd
+	}
+	full := filepath.FromSlash(p)
+	if !filepath.IsAbs(full) {
+		full = filepath.Join(root, full)
+	}
+	full = filepath.Clean(full)
+	// The root itself may be reached through a symlink, so both sides of the
+	// comparison have to be the real paths or every file looks like an escape.
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		realRoot = filepath.Clean(root)
+	}
+	if !withinRoot(realRoot, evalExisting(full)) {
+		return "", fmt.Errorf("path %q escapes the workspace root %q", p, root)
 	}
 	return full, nil
 }
 
-func runInDir(cmd string, dir string, timeout time.Duration) (string, string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+// withinRoot reports whether full is root or lives under it. It compares
+// cleaned paths with filepath.Rel rather than as strings, so a sibling
+// directory that merely shares a prefix (/ws-backup next to /ws) is not
+// mistaken for a child.
+func withinRoot(root, full string) bool {
+	rel, err := filepath.Rel(root, full)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// evalExisting resolves the symlinks along p, following each one component at
+// a time rather than with filepath.EvalSymlinks.
+//
+// EvalSymlinks fails on a link whose target does not exist, and that is
+// exactly the link a model can aim at /etc/cron.d and then create with a
+// write, so the path is walked by hand: a link is followed to its target even
+// when nothing is there yet, and a component that is missing ends the walk
+// (nothing below a missing directory can be a link). A relative target is
+// followed from the directory holding the link, an absolute one restarts at
+// the filesystem root, and a chain longer than any real path gives up and
+// hands back the path as written.
+func evalExisting(p string) string {
+	if !filepath.IsAbs(p) {
+		if wd, err := os.Getwd(); err == nil {
+			p = filepath.Join(wd, p)
+		}
+	}
+	vol := filepath.VolumeName(p)
+	cur := vol + string(filepath.Separator)
+	rest := strings.TrimPrefix(filepath.Clean(p), cur)
+	links := 0
+	for rest != "" {
+		part, tail := rest, ""
+		if i := strings.Index(part, string(filepath.Separator)); i >= 0 {
+			part, tail = rest[:i], rest[i+1:]
+		}
+		rest = tail
+		if part == "" || part == "." {
+			continue
+		}
+		next := filepath.Join(cur, part)
+		fi, err := os.Lstat(next)
+		if err != nil {
+			// Missing from here down, so the remainder is plain text.
+			return joinTail(cur, rest)
+		}
+		if fi.Mode()&fs.ModeSymlink == 0 {
+			cur = next
+			continue
+		}
+		links++
+		if links > 40 {
+			return filepath.Clean(p)
+		}
+		dst, err := os.Readlink(next)
+		if err != nil {
+			return filepath.Clean(p)
+		}
+		if rest != "" {
+			dst = filepath.Join(dst, rest)
+		}
+		if filepath.IsAbs(dst) {
+			v := filepath.VolumeName(dst)
+			cur = v + string(filepath.Separator)
+			rest = strings.TrimPrefix(filepath.Clean(dst), cur)
+		} else {
+			rest = dst
+		}
+	}
+	return cur
+}
+
+// joinTail glues the unresolved remainder back onto dir.
+func joinTail(dir, rest string) string {
+	if rest == "" {
+		return dir
+	}
+	return filepath.Join(append([]string{dir}, strings.Split(rest, string(filepath.Separator))...)...)
+}
+
+func runInDir(ctx context.Context, cmd string, dir string, timeout time.Duration) (string, string, error) {
+	if ctx == nil {
+		// context.WithTimeout panics on a nil parent, and a tool helper is the
+		// wrong place to take the process down over it.
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	var sh string
@@ -329,7 +449,24 @@ func runInDir(cmd string, dir string, timeout time.Duration) (string, string, er
 		}
 	}
 	c.Dir = dir
+	// Cancelling the context kills the shell, not the commands the shell
+	// started, and CombinedOutput does not return until every writer of the
+	// output pipe has closed it. A child that outlives the shell therefore
+	// holds the pipe open and the tool call never returns, so bound that
+	// second wait and let Wait close the pipes.
+	c.WaitDelay = 2 * time.Second
 	out, err := c.CombinedOutput()
+	if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		// Otherwise the kill surfaces as a bare "signal: killed", which reads
+		// as though the command died on its own rather than hitting the limit.
+		return string(out), "", fmt.Errorf("timed out after %s", timeout)
+	}
+	if errors.Is(err, exec.ErrWaitDelay) {
+		// The command itself is gone; something it started is still holding
+		// the output pipe. Say that, rather than passing on a stdlib string
+		// that says nothing about what the user should go and look for.
+		return string(out), "", fmt.Errorf("the command finished but a process it started is still holding its output open")
+	}
 	return string(out), "", err
 }
 
@@ -338,57 +475,6 @@ func hidden(name string) bool {
 	switch name {
 	case ".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build", ".next", ".cache", "target":
 		return true
-	}
-	return false
-}
-
-// RiskyCommands lists destructive shell patterns that always need user
-// confirmation. They are regular expressions matched against the lowercased
-// command, with word boundaries so that `mv /tmp/a /tmp/b` does not trip on the
-// bare token "mv /".
-var RiskyCommands = []string{
-	`\brm\s+-[a-zA-Z]*[rf]`,     // rm -rf, rm -fr, rm -Rf
-	`\brm\s+(-[a-zA-Z]+\s+)+\S`, // rm -r -f dir
-	`\brmdir\s+/(s|q)?`,
-	`\bgit\s+reset\s+--hard`,
-	`\bgit\s+clean\s+-`,
-	`\bgit\s+push\s+(-f\b|--force\b)`,
-	`\bgit\s+checkout\s+--\s`,
-	`\b(drop|truncate)\s+(table|database|schema)\b`,
-	`\bmkfs`,
-	`\bdd\s+if=`,
-	`:\(\)\s*\{`,
-	`\b(shutdown|reboot|poweroff|halt)\b`,
-	`\bkill\s+-9\b`,
-	`\b(pkill|killall)\b`,
-	`\bdocker\s+(system\s+prune|rm\s+-f)`,
-	`\bchmod\s+(-[a-zA-Z]+\s+)*0*777`,
-	`(curl|wget)\s+[^|]*\|\s*(sh|bash)`,
-	`\beval\s`,
-	`>\s*/dev/sd`,
-	`^\s*mv\s+/\s`,
-	`\bformat\s+[a-z]:`,
-	`\bsudo\s`,
-}
-
-var riskyREs = mustCompileAll(RiskyCommands)
-
-func mustCompileAll(patterns []string) []*regexp.Regexp {
-	out := make([]*regexp.Regexp, 0, len(patterns))
-	for _, p := range patterns {
-		out = append(out, regexp.MustCompile(p))
-	}
-	return out
-}
-
-// CommandNeedsApproval inspects a shell command for destructive patterns.
-// The TUI and the agent loop both call this so policy stays in one place.
-func CommandNeedsApproval(cmd string) bool {
-	low := strings.ToLower(cmd)
-	for _, re := range riskyREs {
-		if re.MatchString(low) {
-			return true
-		}
 	}
 	return false
 }
@@ -406,29 +492,6 @@ var ReadOnlyTools = map[string]bool{
 	"git_diff":   true,
 	"ask_user":   true,
 	"todo":       true,
-}
-
-// MutatingTools are the tools that change the workspace and therefore need
-// explicit approval unless the user opted into auto-accepting edits.
-var MutatingTools = map[string]bool{
-	"write":      true,
-	"edit":       true,
-	"multi_edit": true,
-	"patch":      true,
-	"bash":       true,
-}
-
-// NeedsApproval reports whether a tool invocation must be confirmed first.
-// Shell commands only need a prompt when they look destructive.
-func NeedsApproval(name string, args map[string]any) bool {
-	switch name {
-	case "bash":
-		cmd, _ := args["command"].(string)
-		return CommandNeedsApproval(cmd)
-	case "write", "edit", "multi_edit", "patch":
-		return true
-	}
-	return false
 }
 
 // ---- undo ----

@@ -44,7 +44,6 @@ nova --plan
 | `-m <model>` | model by `provider/model`, bare id, or alias |
 | `-C <dir>` | workspace directory |
 | `--plan` | read-only tools only |
-| `--accept-edits` | auto-approve file edits (still prompts for shell) |
 | `-c` | resume the last session |
 | `--theme <name>` | `nova`, `dracula`, `catppuccin`, `gruvbox`, `nord`, `mono` |
 | `--no-color` | disable colour |
@@ -55,11 +54,10 @@ nova --plan
 
 ### Unattended runs
 
-`-p` has no terminal UI, so there is nobody to answer an approval prompt. In
-that mode Nova allows the file edits the agent exists to make — writing,
-editing and patching files go straight through — and refuses destructive
-shell commands rather than guessing at consent. Use `--plan` when you want a
-run that cannot modify anything at all.
+`-p` has no terminal UI. Tools run unattended: file edits the agent exists
+to make — writing, editing and patching files — go straight through, and
+shell commands run without prompting. Use `--plan` when you want a run that
+cannot modify anything at all.
 
 ### Models
 
@@ -67,8 +65,7 @@ Preconfigured providers:
 
 | Provider | Models |
 |---|---|
-| kiosai (default) | `grok-4.7-free`, `muse-spark-1.3-contributor`, `deepseek-v4.1-flash-free`, `space-bunny-alpha` |
-| inferera | `xiaomi-mimo-v2.6-pro-free`, `coding-kimi-k3-free`, `union-alpha-free` |
+| kiosai (default) | `grok-4.7-free`, `muse-spark-1.3-contributor`, `deepseek-v4.1-flash-free`, `space-bunny-alpha`, `longcat-2.5-preview`, `mimo-v2.6-flash` |
 | stepfun | `step-5-preview` (1M context) |
 
 Every provider speaks the OpenAI chat-completions wire format. Switch models
@@ -190,9 +187,8 @@ tool calls it made, and what it spent. `/roles` lists the roles.
 
 Subagents are confined to one level. A subagent that tries to delegate further
 is refused and told to do the work itself, so one confused instruction cannot
-become a tree of agents billed to you. A subagent's shell commands still go
-through the same approval policy, so a destructive command inside one asks you
-exactly as it would outside one.
+become a tree of agents billed to you. A subagent's tools run with the same
+policy as the main agent: unattended, except read-only roles stay read-only.
 
 
 `Esc` is the way out of whatever you are in, and resolves in this order:
@@ -203,7 +199,7 @@ exactly as it would outside one.
 | the model picker is open | closes it, leaving the model as it was |
 | the command list is open | closes the list, keeping what you typed |
 | the prompt box has text | clears it |
-| waiting on a question or an approval | nothing — answer `y`/`n` or type the answer instead |
+| waiting on a question | type the answer instead |
 
 Stopping a turn leaves the prompt exactly as it was, so the usual reason to
 stop is to edit the prompt and send it again.
@@ -251,12 +247,8 @@ and the box is repainted in place as the spinner turns and you type.
 
 ## Safety
 
-Destructive commands are intercepted and need approval before they run:
-`rm -rf`, `git reset --hard`, `git push --force`, `git clean`, `dd`, `kill -9`,
-`docker system prune`, and other patterns in `tools.RiskyCommands`. The
-command is printed, the box rails turn into a prompt, and the agent blocks
-until you answer: `y` runs it, anything else skips it. Plan mode removes
-write access entirely.
+Tools run without approval prompts. Plan mode is the safety boundary: it
+removes write access entirely, leaving read-only tools.
 
 ## Layout
 

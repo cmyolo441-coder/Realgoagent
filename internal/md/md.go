@@ -214,12 +214,19 @@ func looksTableish(line string) bool {
 }
 
 // inline applies inline formatting: code, bold, italic, links.
-// Code spans are tokenized first and restored last so that the emphasis and
-// link regexes can never match ANSI bytes emitted for a code span.
+// File references are processed first so their backtick delimiters are still
+// present; code spans are tokenised next and restored last so that the emphasis
+// and link regexes can never match ANSI bytes emitted for a code span.
 func (r *Renderer) inline(s string) string {
 	p := r.Palette
 
-	// 1. tokenise code spans so nothing else touches their contents
+	// 1. file references with line numbers get accent colour
+	s = reFileRef.ReplaceAllStringFunc(s, func(m string) string {
+		inner := reFileRef.FindStringSubmatch(m)[1]
+		return p.Style("accent2", inner)
+	})
+
+	// 2. tokenise code spans so nothing else touches their contents
 	var codes []string
 	protect := func(in string) string {
 		spans := reInline.FindAllStringSubmatch(in, -1)
@@ -240,11 +247,6 @@ func (r *Renderer) inline(s string) string {
 	}
 	s = protect(s)
 
-	// 2. file references with line numbers get accent colour
-	s = reFileRef.ReplaceAllStringFunc(s, func(m string) string {
-		inner := reFileRef.FindStringSubmatch(m)[1]
-		return p.Style("accent2", inner)
-	})
 	// 3. images (before links)
 	s = reImage.ReplaceAllStringFunc(s, func(m string) string {
 		sub := reImage.FindStringSubmatch(m)
@@ -286,7 +288,7 @@ func (r *Renderer) renderCodeBlock(lang string, lines []string) []string {
 	if lang != "" {
 		header = " " + lang
 	}
-	out = append(out, p.Style("dim", "╭─"+strings.Repeat("─", max(1, r.Width-6-len(header)))+header))
+	out = append(out, p.Style("dim", "╭─"+strings.Repeat("─", max(1, r.Width-6-util.VisibleWidth(header)))+header))
 	nw := len(fmt.Sprint(len(lines)))
 	for i, ln := range lines {
 		num := fmt.Sprintf("%*d ", nw, i+1)
@@ -347,9 +349,10 @@ func (r *Renderer) renderTable(rows []string) []string {
 	if avail < cols*4 {
 		avail = cols * 4
 	}
+	maxCol := avail / cols
 	for i := range widths {
-		if widths[i] > 40 {
-			widths[i] = 40
+		if widths[i] > maxCol {
+			widths[i] = maxCol
 		}
 	}
 	renderRow := func(cells []string, bold bool) {

@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,7 +23,7 @@ func nonRepoDir(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	// t.TempDir can land inside a repository, so check rather than assume.
-	if _, ok := checkGitRepo(dir); ok {
+	if _, ok := checkGitRepo(context.Background(), dir); ok {
 		t.Skip("temp dir is inside a git repository")
 	}
 	return dir

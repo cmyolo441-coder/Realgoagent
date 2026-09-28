@@ -1,9 +1,13 @@
 package tui
 
-import "strings"
+import (
+	"strings"
+	"sync"
+)
 
 // Buffer is a scrollback of rendered lines.
 type Buffer struct {
+	mu    sync.Mutex
 	lines []string
 	max   int
 }
@@ -18,6 +22,8 @@ func NewBuffer(max int) *Buffer {
 
 // Append adds one or more lines.
 func (b *Buffer) Append(lines ...string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.lines = append(b.lines, lines...)
 	if len(b.lines) > b.max {
 		b.lines = append([]string{}, b.lines[len(b.lines)-b.max:]...)
@@ -26,6 +32,8 @@ func (b *Buffer) Append(lines ...string) {
 
 // AppendText splits a block into rendered lines and appends them.
 func (b *Buffer) AppendText(s string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	s = strings.TrimRight(s, "\n")
 	b.lines = append(b.lines, strings.Split(s, "\n")...)
 	if len(b.lines) > b.max {
@@ -34,16 +42,30 @@ func (b *Buffer) AppendText(s string) {
 }
 
 // Lines returns the current lines.
-func (b *Buffer) Lines() []string { return b.lines }
+func (b *Buffer) Lines() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.lines
+}
 
 // Len returns the number of buffered lines.
-func (b *Buffer) Len() int { return len(b.lines) }
+func (b *Buffer) Len() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.lines)
+}
 
 // Clear empties the buffer.
-func (b *Buffer) Clear() { b.lines = nil }
+func (b *Buffer) Clear() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.lines = nil
+}
 
 // Tail returns the last n lines.
 func (b *Buffer) Tail(n int) []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if n <= 0 || n >= len(b.lines) {
 		return b.lines
 	}

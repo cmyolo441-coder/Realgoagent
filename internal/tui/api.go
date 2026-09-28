@@ -16,13 +16,8 @@ import (
 type Options struct {
 	Workspace string
 	PlanMode  bool
-	AutoEdits bool
 	Quiet     bool
 	Continue  bool
-	// NonInteractive marks a run with no terminal UI — the `-p` form. Nobody
-	// can answer an approval prompt, so the policy below cannot simply deny
-	// everything that would need one.
-	NonInteractive bool
 }
 
 // New builds an App with an agent attached.
@@ -39,18 +34,14 @@ func New(cfg *config.Config, opts *Options) (*App, error) {
 		return nil, fmt.Errorf("no model available: %w", err)
 	}
 
-	reg := tools.NewRegistry(nil)
+	reg := tools.NewRegistry()
 	tools.RegisterDefaults(reg)
 	tools.SetWorkspace(opts.Workspace, cfg.Shell)
 	app.Registry = reg
 
 	if opts.PlanMode {
 		app.Mode = ModePlan
-	} else if opts.AutoEdits {
-		app.Mode = ModeAcceptEdits
 	}
-
-	approve := approvalPolicy(opts)
 
 	// Subagents have to be installed here, not only in the interactive path:
 	// `nova -p` runs a full agent turn, and a task tool with no runner behind
@@ -58,18 +49,16 @@ func New(cfg *config.Config, opts *Options) (*App, error) {
 	subagent.Install(&subagent.Runner{
 		Config:    cfg,
 		Workspace: opts.Workspace,
-		Confirm:   approve,
 	})
 
 	ag, err := agent.New(agent.Options{
-		Config:       cfg,
-		Provider:     p,
-		Model:        m,
-		Workspace:    opts.Workspace,
-		Registry:     reg,
-		PlanMode:     opts.PlanMode,
-		Confirmation: approve,
-		EventSink:    func(agent.Event) {},
+		Config:    cfg,
+		Provider:  p,
+		Model:     m,
+		Workspace: opts.Workspace,
+		Registry:  reg,
+		PlanMode:  opts.PlanMode,
+		EventSink: func(agent.Event) {},
 	})
 	if err != nil {
 		return nil, err
@@ -134,28 +123,4 @@ func (a *App) RunOnce(prompt string) (string, error) {
 func (a *App) Banner() string {
 	p := a.Theme
 	return p.Style("dim", "nova ") + p.Style("accent2", a.SelectedModel) + "\n" + p.Style("dim", a.Cwd())
-}
-
-// approvalPolicy decides which tool calls may run unattended, for the agent
-// built by New.
-//
-// Plan mode never reaches here: the registry is read-only, so a write is
-// blocked before the callback is consulted.
-func approvalPolicy(opts *Options) func(name string, args map[string]any) bool {
-	return func(name string, args map[string]any) bool {
-		isEdit := tools.MutatingTools[name] && name != "bash"
-		if isEdit && opts.AutoEdits {
-			return true
-		}
-		if isEdit && opts.NonInteractive {
-			// There is no prompt to answer. Denying every edit would leave the
-			// agent unable to do the one thing it exists for, and the refusal
-			// reaches the model as "the user denied this" — untrue, since no
-			// user was ever asked. File edits are allowed outright. A
-			// destructive shell command is not: it stays refused, because
-			// running it unattended is not a decision to make by default.
-			return true
-		}
-		return !tools.NeedsApproval(name, args)
-	}
 }

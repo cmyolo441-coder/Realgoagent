@@ -130,6 +130,11 @@ func Truncate(s string, w int) string {
 		if inEsc {
 			b.WriteRune(r)
 			switch {
+			case escDepth == 0 && r == '[':
+				// CSI introducer; keep consuming until the final byte.
+			case escDepth == 0 && r == ']':
+				// OSC: now wait for the BEL terminator.
+				escDepth = 1
 			case escDepth == 0 && (r >= 0x40 && r <= 0x7e):
 				inEsc = false
 			case escDepth == 1 && r == 0x07:
@@ -151,7 +156,9 @@ func Truncate(s string, w int) string {
 		width += rw
 	}
 	b.WriteString(ellipsis)
-	b.WriteString("\x1b[0m")
+	if strings.Contains(s, "\x1b") {
+		b.WriteString("\x1b[0m")
+	}
 	return b.String()
 }
 

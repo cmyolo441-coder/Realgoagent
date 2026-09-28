@@ -33,7 +33,7 @@ func TestWriteIsReportedWithBeforeAndAfter(t *testing.T) {
 	// The file does not exist yet, which is the case worth covering: a new
 	// file has no before-text at all.
 	got := captureEdits(t)
-	reg := NewRegistry(nil)
+	reg := NewRegistry()
 	RegisterDefaults(reg)
 	if res := reg.Call(context.Background(), "write", `{"path":"new.txt","content":"one\ntwo\n"}`); res.IsError {
 		t.Fatalf("write failed: %s", res.Output)
@@ -66,7 +66,7 @@ func TestEditIsReportedWithTheOldTextIntact(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reg := NewRegistry(nil)
+	reg := NewRegistry()
 	RegisterDefaults(reg)
 	res := reg.Call(context.Background(), "edit", `{"path":"f.txt","old_string":"beta","new_string":"BETA"}`)
 	if res.IsError {
@@ -89,7 +89,7 @@ func TestUnchangedFileIsNotReported(t *testing.T) {
 	withWorkspace(t)
 	got := captureEdits(t)
 
-	reg := NewRegistry(nil)
+	reg := NewRegistry()
 	RegisterDefaults(reg)
 	// A failed edit leaves the file exactly as it was. Reporting that as a
 	// change would show the user a diff for work that did not happen.
@@ -111,7 +111,7 @@ func TestReadOnlyToolsReportNoEdits(t *testing.T) {
 	}
 	SetWorkspace(dir, "/bin/sh")
 
-	reg := NewRegistry(nil)
+	reg := NewRegistry()
 	RegisterDefaults(reg)
 	if res := reg.Call(context.Background(), "read", `{"path":"f.txt"}`); res.IsError {
 		t.Fatalf("read failed: %s", res.Output)
@@ -133,7 +133,7 @@ func TestPatchReportsEveryFileItTouches(t *testing.T) {
 
 	patch := "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-one\n+ONE\n" +
 		"--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-two\n+TWO\n"
-	reg := NewRegistry(nil)
+	reg := NewRegistry()
 	RegisterDefaults(reg)
 	if res := reg.Call(context.Background(), "patch", `{"patch":`+quote(patch)+`}`); res.IsError {
 		t.Skipf("patch(1) unavailable: %s", res.Output)
@@ -170,7 +170,7 @@ func TestPatchPathsIgnoresDevNull(t *testing.T) {
 func TestTaskToolRefusesWithoutARunner(t *testing.T) {
 	SetRunner(nil)
 	task := &Result{}
-	reg := NewRegistry(nil)
+	reg := NewRegistry()
 	RegisterDefaults(reg)
 	res := reg.Call(context.Background(), "task", `{"task":"do a thing","role":"explore"}`)
 	if res == nil {
@@ -187,7 +187,7 @@ func TestTaskToolRefusesWithoutARunner(t *testing.T) {
 
 func TestTaskToolRejectsUnknownRole(t *testing.T) {
 	SetRunner(stubRunner{})
-	reg := NewRegistry(nil)
+	reg := NewRegistry()
 	RegisterDefaults(reg)
 	res := reg.Call(context.Background(), "task", `{"task":"x","role":"wizard"}`)
 	if !res.IsError || !strings.Contains(res.Output, "unknown role") {
@@ -198,7 +198,7 @@ func TestTaskToolRejectsUnknownRole(t *testing.T) {
 func TestTaskToolReportsTheSubagentAnswer(t *testing.T) {
 	SetRunner(stubRunner{reply: "the caller is main.go:42"})
 	defer SetRunner(nil)
-	reg := NewRegistry(nil)
+	reg := NewRegistry()
 	RegisterDefaults(reg)
 	res := reg.Call(context.Background(), "task", `{"task":"find it","role":"explore"}`)
 	if res.IsError {
@@ -214,7 +214,7 @@ func TestTaskToolIsDepthCapped(t *testing.T) {
 	defer SetRunner(nil)
 	// A subagent asking for a subagent is the case that has to be refused.
 	WithDepth(1, func() {
-		reg := NewRegistry(nil)
+		reg := NewRegistry()
 		RegisterDefaults(reg)
 		res := reg.Call(context.Background(), "task", `{"task":"go deeper","role":"explore"}`)
 		if !res.IsError {
@@ -237,7 +237,7 @@ func TestDepthIsRestoredAfterTheRun(t *testing.T) {
 }
 
 func TestNewReturnsEveryBuiltinTool(t *testing.T) {
-	reg := NewRegistry(nil)
+	reg := NewRegistry()
 	RegisterDefaults(reg)
 	for _, name := range reg.Names() {
 		if _, ok := New(name); !ok {

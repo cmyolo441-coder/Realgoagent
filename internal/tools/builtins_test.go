@@ -231,7 +231,7 @@ func TestSchemaRequired(t *testing.T) {
 
 func TestRegistryDispatch(t *testing.T) {
 	setupWorkspace(t)
-	reg := NewRegistry(nil)
+	reg := NewRegistry()
 	RegisterDefaults(reg)
 	if len(reg.Names()) < 10 {
 		t.Fatalf("expected at least 10 tools, got %d", len(reg.Names()))
@@ -250,30 +250,33 @@ func TestRegistryDispatch(t *testing.T) {
 	}
 }
 
-func TestConfirmDenies(t *testing.T) {
+// Tool calls run as soon as the agent asks for them. Read-only mode is the
+// only thing that still stops one.
+func TestRegistryRunsTools(t *testing.T) {
 	setupWorkspace(t)
-	reg := NewRegistry(func(string, map[string]any) bool { return false })
+	reg := NewRegistry()
 	RegisterDefaults(reg)
-	res := reg.Call(context.Background(), "bash", `{"command":"echo hi"}`)
-	if !res.IsError || !strings.Contains(res.Output, "denied") {
-		t.Errorf("expected denial, got %q", res.Output)
+	if res := reg.Call(context.Background(), "bash", `{"command":"echo hi"}`); res.IsError {
+		t.Errorf("bash should run unattended, got %q", res.Output)
 	}
 }
 
-func TestCommandNeedsApproval(t *testing.T) {
-	if !CommandNeedsApproval("rm -rf /tmp/x") {
-		t.Error("rm -rf should need approval")
+func TestReadOnlyBlocksWrites(t *testing.T) {
+	dir := setupWorkspace(t)
+	reg := NewRegistry()
+	RegisterDefaults(reg)
+	reg.ReadOnly = true
+	res := reg.Call(context.Background(), "write", `{"path":"blocked.txt","content":"x"}`)
+	if !res.IsError || !strings.Contains(res.Output, "plan mode") {
+		t.Errorf("write should be blocked in read-only mode, got %q", res.Output)
 	}
-	if !CommandNeedsApproval("git push --force") {
-		t.Error("force push should need approval")
-	}
-	if CommandNeedsApproval("go build ./...") {
-		t.Error("go build should not need approval")
+	if _, err := os.Stat(filepath.Join(dir, "blocked.txt")); !os.IsNotExist(err) {
+		t.Error("blocked write left a file behind")
 	}
 }
 
 func TestLLMToolsSchema(t *testing.T) {
-	reg := NewRegistry(nil)
+	reg := NewRegistry()
 	RegisterDefaults(reg)
 	specs := reg.ToLLMTools()
 	if len(specs) < 10 {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -121,6 +122,13 @@ func (webFetchTool) Run(ctx context.Context, a map[string]any) *Result {
 		return errResult("web_fetch: url must start with http")
 	}
 	maxChars := argInt(a, "max_chars", 20000)
+	if maxChars <= 0 {
+		// A non-positive cap is not a request for the whole page. Every other
+		// tool treats a non-positive limit as its default, and honouring this
+		// one would hand up to 8MB of a page to the model, which is the one
+		// thing a tool result must not do.
+		maxChars = 20000
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return errResult("web_fetch: %v", err)
@@ -165,13 +173,26 @@ func htmlToText(s string) string {
 	return strings.Join(out, "\n")
 }
 
+// cutScripts removes every script block, not just the first. A page almost
+// always has more than one, and leaving the rest in place dumps raw
+// javascript into the "readable text" the model is shown.
 func cutScripts(s string) string {
-	open := strings.Index(strings.ToLower(s), "<script")
-	closeIdx := strings.Index(strings.ToLower(s), "</script")
-	if open < 0 || closeIdx < 0 {
-		return s
+	for {
+		low := strings.ToLower(s)
+		open := strings.Index(low, "<script")
+		if open < 0 {
+			return s
+		}
+		// The closing tag is searched for from the opening one: a page that
+		// mentions "</script>" in a comment before its first script would
+		// otherwise splice the two together and duplicate half the document.
+		closeIdx := strings.Index(low[open:], "</script")
+		if closeIdx < 0 {
+			return s
+		}
+		end := open + closeIdx + len("</script")
+		s = s[:open] + s[end:]
 	}
-	return s[:open] + s[closeIdx+8:]
 }
 
 // ---- web_search ----
@@ -215,14 +236,14 @@ func (webSearchTool) Run(ctx context.Context, a map[string]any) *Result {
 	if rerr != nil {
 		return errResult("web_search: %v", rerr)
 	}
-	text := htmlToText(string(body))
+	text := string(body)
 	var out []string
-	for _, ln := range strings.Split(text, "\n") {
+	for _, m := range resultLinkRe.FindAllStringSubmatch(text, -1) {
 		if len(out) >= limit {
 			break
 		}
-		if len(ln) > 12 && !strings.Contains(ln, "DuckDuckGo") {
-			out = append(out, ln)
+		if title := strings.TrimSpace(htmlToText(m[1])); title != "" {
+			out = append(out, title)
 		}
 	}
 	if len(out) == 0 {
@@ -232,11 +253,24 @@ func (webSearchTool) Run(ctx context.Context, a map[string]any) *Result {
 }
 
 func urlQuery(s string) string {
-	r := strings.NewReplacer(" ", "+", "\"", "%22", "&", "%26")
-	return r.Replace(s)
+	return url.QueryEscape(s)
 }
 
+// resultLinkRe matches DuckDuckGo Lite result title links. The class attribute
+// may appear in any order relative to other attributes, so the regex allows
+// for that flexibility.
+var resultLinkRe = regexp.MustCompile(`<a[^>]*class="[^"]*result-link[^"]*"[^>]*>(.*?)</a>`)
+
 // ---- git helpers ----
+
+// devNullRedirect is the platform-appropriate way to suppress stderr in shell
+// commands. On Unix-like systems this is "2>/dev/null"; on Windows it is "2>nul".
+var devNullRedirect = func() string {
+	if runtime.GOOS == "windows" {
+		return "2>nul"
+	}
+	return "2>/dev/null"
+}()
 
 type gitStatusTool struct{}
 
@@ -251,26 +285,26 @@ func (gitStatusTool) Run(ctx context.Context, a map[string]any) *Result {
 	// Check for a repository first. Running git and echoing its stderr produced
 	// a wall of "fatal: not a git repository" that looked like a tool failure
 	// rather than a fact about the workspace, and cost the model a turn.
-	if reason, ok := checkGitRepo(ws); !ok {
+	if reason, ok := checkGitRepo(ctx, ws); !ok {
 		return &Result{Output: reason}
 	}
 
 	var b strings.Builder
-	branch, _, _ := runInDir("git rev-parse --abbrev-ref HEAD 2>/dev/null", ws, 10*time.Second)
+	branch, _, _ := runInDir(ctx, "git rev-parse --abbrev-ref HEAD "+devNullRedirect, ws, 10*time.Second)
 	if strings.TrimSpace(branch) == "" {
 		branch = "(detached)"
 	}
 	b.WriteString("branch: " + strings.TrimSpace(branch) + "\n")
 
 	// Ahead/behind is worth a line of its own; it is what people look for.
-	if ab, _, _ := runInDir("git rev-list --left-right --count @{upstream}...HEAD 2>/dev/null", ws, 10*time.Second); strings.TrimSpace(ab) != "" {
+	if ab, _, _ := runInDir(ctx, "git rev-list --left-right --count @{upstream}...HEAD "+devNullRedirect, ws, 10*time.Second); strings.TrimSpace(ab) != "" {
 		parts := strings.Fields(ab)
 		if len(parts) == 2 {
 			b.WriteString(fmt.Sprintf("upstream: %s behind, %s ahead\n", parts[0], parts[1]))
 		}
 	}
 
-	porcelain, _, _ := runInDir("git status --porcelain 2>/dev/null", ws, 15*time.Second)
+	porcelain, _, _ := runInDir(ctx, "git status --porcelain "+devNullRedirect, ws, 15*time.Second)
 	changed, staged := summarisePorcelain(porcelain)
 	switch {
 	case changed == 0:
@@ -279,7 +313,7 @@ func (gitStatusTool) Run(ctx context.Context, a map[string]any) *Result {
 		b.WriteString(fmt.Sprintf("working tree: %d changed, %d staged\n", changed, staged))
 	}
 
-	if log, _, _ := runInDir("git log --oneline -5 2>/dev/null", ws, 10*time.Second); strings.TrimSpace(log) != "" {
+	if log, _, _ := runInDir(ctx, "git log --oneline -5 "+devNullRedirect, ws, 10*time.Second); strings.TrimSpace(log) != "" {
 		b.WriteString("\nrecent commits:\n" + strings.TrimRight(log, "\n"))
 	}
 	return &Result{Output: b.String()}
@@ -287,12 +321,12 @@ func (gitStatusTool) Run(ctx context.Context, a map[string]any) *Result {
 
 // checkGitRepo reports whether dir is inside a git work tree. When it is not,
 // the returned string explains it in terms the model can act on.
-func checkGitRepo(dir string) (string, bool) {
+func checkGitRepo(ctx context.Context, dir string) (string, bool) {
 	if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
 		return "", true
 	}
 	// A worktree or a bare repo has no .git directory, so ask git itself.
-	if out, _, _ := runInDir("git rev-parse --is-inside-work-tree 2>/dev/null", dir, 10*time.Second); strings.TrimSpace(out) == "true" {
+	if out, _, _ := runInDir(ctx, "git rev-parse --is-inside-work-tree "+devNullRedirect, dir, 10*time.Second); strings.TrimSpace(out) == "true" {
 		return "", true
 	}
 	return "not a git repository: " + dir + "\n" +
@@ -332,7 +366,7 @@ func (gitDiffTool) Run(ctx context.Context, a map[string]any) *Result {
 	ws := workspace()
 	// Same reasoning as git_status: say the workspace is not a repository
 	// rather than returning git's fatal message as if the tool had failed.
-	if reason, ok := checkGitRepo(ws); !ok {
+	if reason, ok := checkGitRepo(ctx, ws); !ok {
 		return &Result{Output: reason}
 	}
 
@@ -346,7 +380,7 @@ func (gitDiffTool) Run(ctx context.Context, a map[string]any) *Result {
 	if p, _ := argString(a, "path"); p != "" {
 		cmd += " -- " + shellQuote(p)
 	}
-	out, _, err := runInDir(cmd, ws, 60*time.Second)
+	out, _, err := runInDir(ctx, cmd, ws, 60*time.Second)
 	out = strings.TrimRight(out, "\n")
 	if out == "" {
 		if argBool(a, "staged", false) {
@@ -359,7 +393,7 @@ func (gitDiffTool) Run(ctx context.Context, a map[string]any) *Result {
 
 // ---- lsp-ish: go build/test shortcuts are just bash ----
 
-// ---- ask_user (interactive confirmation is handled in the agent, this is the fallback) ----
+// ---- ask_user (the interactive path is handled in the agent, this is the fallback) ----
 
 type askUserTool struct{}
 
@@ -458,6 +492,9 @@ func humanSize(n int64) string {
 	for m := n / unit; m >= unit; m /= unit {
 		div *= unit
 		exp++
+	}
+	if exp >= len("KMGTPE") {
+		exp = len("KMGTPE") - 1
 	}
 	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }

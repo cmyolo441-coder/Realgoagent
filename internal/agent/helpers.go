@@ -1,9 +1,11 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // jsonUnmarshal tolerates code fences around JSON arguments.
@@ -53,6 +55,10 @@ func repairJSON(s string) string {
 }
 
 func runShell(cmd, dir string) (string, error) {
-	out, err := exec.Command("sh", "-c", cmd).Output()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	c := exec.CommandContext(ctx, "sh", "-c", cmd)
+	c.Dir = dir
+	out, err := c.CombinedOutput()
 	return strings.TrimSpace(string(out)), err
 }

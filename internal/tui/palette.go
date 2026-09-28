@@ -45,6 +45,8 @@ func (t *TUI) paletteLen() int { return len(t.paletteCommands()) }
 // syncPalette resets the highlight when the composer changes, so typing a new
 // prefix always starts the walk from the top — and reopens a palette the user
 // dismissed with Esc, once they start typing again.
+//
+// Called with t.mu held.
 func (t *TUI) syncPalette() int {
 	key := ""
 	if len(t.inputLines) == 1 {

@@ -24,10 +24,6 @@ const (
 	EvToolStart  EventKind = "tool_start"
 	EvToolResult EventKind = "tool_result"
 	EvToolDenied EventKind = "tool_denied"
-	// EvToolApproval is emitted before a risky call blocks on the user, so the
-	// front-end can render the prompt from the event loop rather than from the
-	// agent goroutine.
-	EvToolApproval EventKind = "tool_approval"
 	// EvReasoningHidden reports how much of the model's internal monologue was
 	// filtered out of a reply, so the UI can say so rather than silently
 	// losing text.
@@ -38,6 +34,10 @@ const (
 	EvDone            EventKind = "done"
 	EvUsage           EventKind = "usage"
 	EvModelWait       EventKind = "model_wait"
+	// EvToolProgress streams partial tool-call arguments while the model is
+	// still producing them, so the front-end can preview a write line by
+	// line instead of showing the diff only after the tool has run.
+	EvToolProgress EventKind = "tool_progress"
 	// EvEdit reports a file change the agent just made, with the text on both
 	// sides of it, so the front-end can show the change as it lands rather
 	// than leaving the user to reconstruct it from a final diff.
@@ -66,10 +66,9 @@ type Options struct {
 	Model     *config.Model
 	Workspace string
 	Registry  *tools.Registry
-	// PlanMode restricts the loop to read-only tools.
+	// PlanMode restricts the loop to read-only tools. It is the only gate:
+	// a tool outside read-only mode runs as soon as the model asks for it.
 	PlanMode bool
-	// Confirmation is called before a risky tool runs. Returning false denies it.
-	Confirmation func(tool string, args map[string]any) bool
 	// OnAskUser is invoked when the model calls ask_user.
 	OnAskUser func(question string) string
 	// EventSink receives all events; may be nil.
@@ -91,6 +90,20 @@ func (a *Agent) SetPlanMode(on bool) {
 	a.mu.Unlock()
 }
 
+// readOnly reports whether the registry is currently in read-only mode.
+func (a *Agent) readOnly() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.opt.Registry.ReadOnly
+}
+
+// onAskUser returns the ask_user callback, if the front-end installed one.
+func (a *Agent) onAskUser() func(question string) string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.opt.OnAskUser
+}
+
 // PlanMode reports whether the agent is read-only.
 func (a *Agent) PlanMode() bool {
 	a.mu.Lock()
@@ -100,15 +113,20 @@ func (a *Agent) PlanMode() bool {
 
 // Agent runs the conversation loop.
 type Agent struct {
-	opt        Options
-	client     *llm.Client
-	mu         sync.Mutex
-	messages   []llm.Message
+	opt      Options
+	client   *llm.Client
+	mu       sync.Mutex
+	messages []llm.Message
+	// totalUsage accumulates across the whole conversation, not one turn.
 	totalUsage llm.Usage
 	toolNames  []string
 	cwd        string
 	ctx        context.Context
 	cancel     context.CancelFunc
+	// sinkMu guards opt.EventSink on its own, separate from mu. A sink may
+	// block — on the UI bus, or on the user answering a prompt — so it must
+	// never be invoked with the agent state locked.
+	sinkMu sync.Mutex
 }
 
 // New constructs an Agent.
@@ -120,7 +138,7 @@ func New(o Options) (*Agent, error) {
 		return nil, fmt.Errorf("agent: provider and model are required")
 	}
 	if o.Registry == nil {
-		o.Registry = tools.NewRegistry(o.Confirmation)
+		o.Registry = tools.NewRegistry()
 		tools.RegisterDefaults(o.Registry)
 	}
 	if o.EventSink == nil {
@@ -133,6 +151,7 @@ func New(o Options) (*Agent, error) {
 		o.MaxIterations = 60
 	}
 
+	o.Registry.ReadOnly = o.PlanMode
 	a := &Agent{
 		opt:       o,
 		client:    llm.NewClient(o.Provider.BaseURL, o.Provider.APIKeyFromEnv(), o.Model.ID),
@@ -140,7 +159,6 @@ func New(o Options) (*Agent, error) {
 		toolNames: o.Registry.Names(),
 		cwd:       o.Workspace,
 	}
-	a.opt.Registry.ReadOnly = o.PlanMode
 	a.ctx, a.cancel = context.WithCancel(context.Background())
 	return a, nil
 }
@@ -179,6 +197,8 @@ func (a *Agent) SystemPrompt() string {
 }
 
 func (a *Agent) cfgShell() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	if s := a.opt.Config.Shell; s != "" {
 		return s
 	}
@@ -192,11 +212,20 @@ func (a *Agent) SetOnDone(f func()) {
 	a.mu.Unlock()
 }
 
+// onDoneFn returns the per-turn completion callback. It is called with the
+// lock released: the hook persists the session, and persisting reads the
+// conversation back through Messages and Usage.
+func (a *Agent) onDoneFn() func() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.opt.OnDone
+}
+
 // SetSink replaces the event sink after construction.
 func (a *Agent) SetSink(f func(Event)) {
-	a.mu.Lock()
+	a.sinkMu.Lock()
 	a.opt.EventSink = f
-	a.mu.Unlock()
+	a.sinkMu.Unlock()
 }
 
 // Cancel stops a running turn. The loop notices at its next checkpoint and
@@ -215,7 +244,11 @@ func (a *Agent) Reset() {
 	a.mu.Lock()
 	a.messages = []llm.Message{}
 	a.totalUsage = llm.Usage{}
+	cancel := a.cancel
 	a.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 // Messages returns a copy of the conversation history.
@@ -238,6 +271,7 @@ func (a *Agent) Usage() llm.Usage {
 func (a *Agent) InjectHistory(msgs []llm.Message) {
 	a.mu.Lock()
 	a.messages = append([]llm.Message{}, msgs...)
+	a.totalUsage = llm.Usage{}
 	a.mu.Unlock()
 }
 
@@ -260,18 +294,31 @@ func (a *Agent) RunTask(parent context.Context, userText string) (err error) {
 	}
 	// A fresh context per turn: the previous turn's cancel must not poison the
 	// next one, or every message after a Ctrl-C would fail instantly.
-	if a.cancel != nil {
-		a.cancel()
+	a.mu.Lock()
+	prev := a.cancel
+	a.mu.Unlock()
+	if prev != nil {
+		prev()
 	}
 	// Render the system prompt before taking the lock: SystemPrompt snapshots
 	// agent state itself and would otherwise deadlock on a.mu.
 	system := a.SystemPrompt()
 
+	turnCtx, turnCancel := context.WithCancel(parent)
 	a.mu.Lock()
-	a.ctx, a.cancel = context.WithCancel(parent)
-	a.messages = append(a.messages, llm.Message{Role: llm.RoleSystem, Content: system})
+	a.ctx, a.cancel = turnCtx, turnCancel
+	// Replace the system message to prevent unbounded growth
+	if len(a.messages) > 0 && a.messages[0].Role == llm.RoleSystem {
+		a.messages[0] = llm.Message{Role: llm.RoleSystem, Content: system}
+	} else {
+		a.messages = append([]llm.Message{{Role: llm.RoleSystem, Content: system}}, a.messages...)
+	}
 	a.messages = append(a.messages, llm.Message{Role: llm.RoleUser, Content: userText})
 	a.mu.Unlock()
+	// Release the turn's context on every exit path. A stream reader or a tool
+	// still winding down watches this context, so cancelling it here is what
+	// stops it from holding a connection open for a turn that is already over.
+	defer turnCancel()
 
 	// completed is set by the success path. Every other exit — a stream error,
 	// a cancelled context, the iteration cap — still has to announce the end of
@@ -287,22 +334,23 @@ func (a *Agent) RunTask(parent context.Context, userText string) (err error) {
 		}
 		a.emit(Event{Kind: EvUsage, Usage: a.usageCopy()})
 		a.emit(Event{Kind: EvDone, Text: summary})
-		if a.opt.OnDone != nil {
-			a.opt.OnDone()
+		if onDone := a.onDoneFn(); onDone != nil {
+			onDone()
 		}
 	}()
 
-	for iter := 1; iter <= a.opt.MaxIterations; iter++ {
+	maxIter := a.opt.MaxIterations
+	for iter := 1; iter <= maxIter; iter++ {
 		iterations = iter
 		select {
-		case <-a.ctx.Done():
-			return a.ctx.Err()
+		case <-turnCtx.Done():
+			return turnCtx.Err()
 		default:
 		}
 		a.emit(Event{Kind: EvIteration, Text: fmt.Sprintf("%d", iter)})
 
 		req := a.buildRequest()
-		chunks := a.client.Stream(a.ctx, req)
+		chunks := a.client.Stream(turnCtx, req)
 
 		var streamed strings.Builder
 		var toolCalls []llm.ToolCall
@@ -330,11 +378,29 @@ func (a *Agent) RunTask(parent context.Context, userText string) (err error) {
 			}
 			for _, tc := range c.Delta.Tools {
 				streamMerge(&toolCalls, tc)
+				// Emit the merged arguments so far: the UI keeps only the
+				// latest frame per tool call and diffs it against the file
+				// on disk, which is what makes a 10-line write appear line
+				// by line while the model is still producing it.
+				if merged := mergedToolCall(toolCalls, tc); merged != nil {
+					a.emit(Event{Kind: EvToolProgress, Tool: merged.Function.Name, Output: merged.Function.Arguments, Text: merged.ID})
+				}
 			}
 			if c.Usage != nil {
 				u := *c.Usage
 				usage = &u
 			}
+		}
+		// A stream that closed because the turn was cancelled must not be
+		// mistaken for a complete reply. The HTTP body can reach EOF at the
+		// same moment as the cancel, in which case no error chunk arrives and
+		// the tool calls from the aborted reply would run after the user
+		// pressed Esc.
+		if cerr := turnCtx.Err(); cerr != nil {
+			if !errors.Is(cerr, context.Canceled) {
+				a.emit(Event{Kind: EvError, Text: cerr.Error(), IsErr: true})
+			}
+			return cerr
 		}
 		// A reply that ended mid-reasoning still has to deliver whatever came
 		// before the opening tag.
@@ -362,12 +428,24 @@ func (a *Agent) RunTask(parent context.Context, userText string) (err error) {
 		}
 
 		// Execute tool calls; they run sequentially to keep ordering readable.
-		a.mu.Lock()
-		a.messages = append(a.messages, a.runToolCalls(toolCalls)...)
-		a.mu.Unlock()
+		// They run with no lock held: a tool can block on an ask_user answer,
+		// and holding a.mu across that would deadlock every other method on the
+		// agent, including Cancel, so Esc could not stop the turn.
+		toolMsgs := a.runToolCalls(turnCtx, toolCalls)
+		a.appendMessages(toolMsgs)
 	}
-	a.emit(Event{Kind: EvError, Text: fmt.Sprintf("reached max iterations (%d)", a.opt.MaxIterations), IsErr: true})
-	return fmt.Errorf("max iterations reached (%d)", a.opt.MaxIterations)
+	a.emit(Event{Kind: EvError, Text: fmt.Sprintf("reached max iterations (%d)", maxIter), IsErr: true})
+	return fmt.Errorf("max iterations reached (%d)", maxIter)
+}
+
+// appendMessages extends the conversation history.
+func (a *Agent) appendMessages(msgs []llm.Message) {
+	if len(msgs) == 0 {
+		return
+	}
+	a.mu.Lock()
+	a.messages = append(a.messages, msgs...)
+	a.mu.Unlock()
 }
 
 func (a *Agent) buildRequest() llm.Request {
@@ -385,12 +463,12 @@ func (a *Agent) buildRequest() llm.Request {
 		msgs = append(msgs, m)
 	}
 	temp := a.opt.Config.Temperature
-	maxTok := a.opt.Config.MaxTokens
+	registry := a.opt.Registry
 	a.mu.Unlock()
 	msgs = append([]llm.Message{{Role: llm.RoleSystem, Content: system}}, msgs...)
 
 	llmTools := make([]llm.Tool, 0)
-	for _, t := range a.opt.Registry.List() {
+	for _, t := range registry.List() {
 		llmTools = append(llmTools, llm.Tool{
 			Type: "function",
 			Function: llm.ToolFunction{
@@ -404,31 +482,52 @@ func (a *Agent) buildRequest() llm.Request {
 		Messages:    msgs,
 		Tools:       llmTools,
 		Temperature: temp,
-		MaxTokens:   maxTok,
+		MaxTokens:   a.maxOutputTokens(msgs, llmTools),
 	}
 }
 
-func (a *Agent) runToolCalls(calls []llm.ToolCall) []llm.Message {
+// maxOutputTokens sizes max_tokens for the active model — the single place the
+// output budget is decided. The model's own limit is used, then clamped to the
+// room left in its context window once the prompt and the tool schemas are
+// counted, so a long conversation narrows the reply instead of asking the
+// provider for a request that cannot fit.
+func (a *Agent) maxOutputTokens(msgs []llm.Message, tools []llm.Tool) int {
+	est := 0
+	for _, m := range msgs {
+		est += config.EstimateTokens(m.Content) + config.EstimateTokens(m.Name) + 4
+		for _, tc := range m.ToolCalls {
+			est += config.EstimateTokens(tc.Function.Name) +
+				config.EstimateTokens(tc.Function.Arguments) + 8
+		}
+	}
+	for _, t := range tools {
+		est += config.EstimateTokens(t.Function.Name) +
+			config.EstimateTokens(t.Function.Description) + 8
+		for _, v := range t.Function.Parameters {
+			est += config.EstimateTokens(fmt.Sprint(v))
+		}
+	}
+	return a.opt.Config.MaxOutputTokens(a.opt.Model, est)
+}
+
+// runToolCalls executes one batch of tool calls in order. ctx is the running
+// turn's context, passed in rather than read from the field so a concurrent
+// turn cannot swap it out from under the call in flight.
+func (a *Agent) runToolCalls(ctx context.Context, calls []llm.ToolCall) []llm.Message {
 	out := make([]llm.Message, 0, len(calls))
 	for _, tc := range calls {
 		args := parseArgs(tc.Function.Arguments)
 
-		// One policy decision covers both the registry gate and the agent-side
-		// prompt: read-only mode and risky calls both block here first.
-		if a.opt.Registry.ReadOnly && !tools.ReadOnlyTools[tc.Function.Name] {
+		// Read-only mode is the one gate left: a tool that would change the
+		// workspace is refused in plan mode, and the model is told to describe
+		// the change instead. Outside it, the call just runs.
+		if a.readOnly() && !tools.ReadOnlyTools[tc.Function.Name] {
 			a.emit(Event{Kind: EvToolDenied, Tool: tc.Function.Name})
 			out = append(out, llm.Message{
 				Role: llm.RoleTool, ToolCallID: tc.ID, Name: tc.Function.Name,
 				Content: fmt.Sprintf("%s is blocked in plan mode. Describe the change and let the user run it.", tc.Function.Name),
 			})
 			continue
-		}
-		if a.opt.Confirmation != nil && tools.NeedsApproval(tc.Function.Name, args) {
-			if !a.opt.Confirmation(tc.Function.Name, args) {
-				a.emit(Event{Kind: EvToolDenied, Tool: tc.Function.Name})
-				out = append(out, llm.Message{Role: llm.RoleTool, ToolCallID: tc.ID, Name: tc.Function.Name, Content: "The user denied this tool call. Ask what to do instead."})
-				continue
-			}
 		}
 
 		a.emit(Event{
@@ -446,8 +545,8 @@ func (a *Agent) runToolCalls(calls []llm.ToolCall) []llm.Message {
 			// agent waits for the typed answer.
 			a.emit(Event{Kind: EvAskUser, Text: q})
 			answer := ""
-			if a.opt.OnAskUser != nil {
-				answer = a.opt.OnAskUser(q)
+			if ask := a.onAskUser(); ask != nil {
+				answer = ask(q)
 			}
 			if strings.TrimSpace(answer) == "" {
 				answer = "(no answer given)"
@@ -459,7 +558,10 @@ func (a *Agent) runToolCalls(calls []llm.ToolCall) []llm.Message {
 			continue
 		}
 
-		res := a.opt.Registry.Call(a.ctx, tc.Function.Name, tc.Function.Arguments)
+		a.mu.Lock()
+		registry := a.opt.Registry
+		a.mu.Unlock()
+		res := registry.Call(ctx, tc.Function.Name, tc.Function.Arguments)
 		ev := Event{
 			Kind:   EvToolResult,
 			Tool:   tc.Function.Name,
@@ -479,8 +581,14 @@ func (a *Agent) runToolCalls(calls []llm.ToolCall) []llm.Message {
 }
 
 func (a *Agent) emit(e Event) {
-	if a.opt.EventSink != nil {
-		a.opt.EventSink(e)
+	// The sink is read under its own lock and called with every lock released:
+	// a sink may block on the UI bus, so it must not be able to hold up the
+	// state the rest of the agent needs.
+	a.sinkMu.Lock()
+	sink := a.opt.EventSink
+	a.sinkMu.Unlock()
+	if sink != nil {
+		sink(e)
 	}
 }
 
@@ -508,7 +616,7 @@ func streamMerge(list *[]llm.ToolCall, tc llm.ToolCall) {
 		cp := tc
 		cp.Type = "function"
 		if cp.ID == "" {
-			cp.ID = fmt.Sprintf("call_%d", len(*list))
+			cp.ID = fmt.Sprintf("agent_call_%d", len(*list))
 		}
 		*list = append(*list, cp)
 		return
@@ -516,6 +624,22 @@ func streamMerge(list *[]llm.ToolCall, tc llm.ToolCall) {
 	appendFrag(&(*list)[len(*list)-1], tc)
 }
 
+// mergedToolCall returns the accumulated call streamMerge just updated, so
+// the progress event carries the arguments merged so far rather than the
+func mergedToolCall(list []llm.ToolCall, frag llm.ToolCall) *llm.ToolCall {
+	if frag.ID != "" {
+		for i := range list {
+			if list[i].ID == frag.ID {
+				return &list[i]
+			}
+		}
+		return nil
+	}
+	if len(list) == 0 {
+		return nil
+	}
+	return &list[len(list)-1]
+}
 func appendFrag(dst *llm.ToolCall, src llm.ToolCall) {
 	if src.Function.Name != "" {
 		dst.Function.Name = src.Function.Name
@@ -527,9 +651,9 @@ func appendFrag(dst *llm.ToolCall, src llm.ToolCall) {
 }
 
 func parseArgs(s string) map[string]any {
-	var m map[string]any
+	m := make(map[string]any)
 	if err := jsonUnmarshal(s, &m); err != nil {
-		return nil
+		return m
 	}
 	return m
 }

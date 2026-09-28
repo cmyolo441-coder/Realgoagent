@@ -32,7 +32,7 @@ func init() {
 		{"/models", "Pick a model with ↑↓ and ⏎", cmdModels},
 		{"/theme", "Switch colour theme", cmdTheme},
 		{"/themes", "List colour themes", cmdThemes},
-		{"/mode", "Set agent mode: agent | plan | accept-edits", cmdMode},
+		{"/mode", "Set agent mode: agent | plan", cmdMode},
 		{"/status", "Show configuration and session status", cmdStatus},
 		{"/doctor", "Check config, keys, model and workspace", cmdDoctor},
 		{"/config", "Show the config file path", cmdConfig},
@@ -175,16 +175,14 @@ func cmdThemes(t *TUI, args string) error {
 }
 
 func cmdMode(t *TUI, args string) error {
-	names := map[Mode]string{ModeAgent: "agent", ModePlan: "plan", ModeAcceptEdits: "accept-edits"}
+	names := map[Mode]string{ModeAgent: "agent", ModePlan: "plan"}
 	switch strings.TrimSpace(strings.ToLower(args)) {
 	case "", "agent":
 		t.app.Mode = ModeAgent
 	case "plan", "plan-mode", "readonly":
 		t.app.Mode = ModePlan
-	case "accept-edits", "auto", "accept":
-		t.app.Mode = ModeAcceptEdits
 	default:
-		t.app.history.Append(t.app.Theme.Style("error", "modes: agent, plan, accept-edits"))
+		t.app.history.Append(t.app.Theme.Style("error", "modes: agent, plan"))
 		return nil
 	}
 	// Push the new mode into the live agent so the tool set and the system
@@ -474,7 +472,7 @@ func rebuildAgent(t *TUI, p *config.Provider, m *config.Model) error {
 	}
 	reg := t.app.Registry
 	if reg == nil {
-		reg = tools.NewRegistry(nil)
+		reg = tools.NewRegistry()
 		tools.RegisterDefaults(reg)
 	}
 	tools.SetWorkspace(t.app.Workspace, t.app.Cfg.Shell)
@@ -486,27 +484,12 @@ func rebuildAgent(t *TUI, p *config.Provider, m *config.Model) error {
 		t.send(agent.Event{Kind: agent.EvEdit, Tool: rec.Tool, Edit: &rec})
 	})
 
-	autoEdit := func(name string) bool {
-		return t.app.Mode == ModeAcceptEdits && tools.MutatingTools[name] && name != "bash"
-	}
-
-	// Subagents get the same workspace and the same approval policy as the
-	// main agent, so a risky command inside one asks the user exactly as it
-	// would outside one. What they do not get is the parent's conversation:
-	// a delegated job is described entirely by its own task.
+	// Subagents get the same workspace as the main agent. What they do not get
+	// is the parent's conversation: a delegated job is described entirely by
+	// its own task.
 	sub := &subagent.Runner{
 		Config:    t.app.Cfg,
 		Workspace: t.app.Workspace,
-		Confirm: func(name string, args map[string]any) bool {
-			if autoEdit(name) {
-				return true
-			}
-			if !tools.NeedsApproval(name, args) {
-				return true
-			}
-			t.messageBus <- agent.Event{Kind: agent.EvToolApproval, Tool: name, Args: args}
-			return t.askApproval()
-		},
 		OnEvent: func(ev subagent.Event) {
 			t.app.subs.handleEvent(ev)
 			t.scheduleDraw()
@@ -521,19 +504,6 @@ func rebuildAgent(t *TUI, p *config.Provider, m *config.Model) error {
 		Workspace: t.app.Workspace,
 		Registry:  reg,
 		PlanMode:  t.app.Mode == ModePlan,
-		Confirmation: func(name string, args map[string]any) bool {
-			if autoEdit(name) {
-				return true
-			}
-			if !tools.NeedsApproval(name, args) {
-				return true
-			}
-			// Risky calls block the agent until the user answers in the prompt.
-			// The prompt itself is emitted as an event so that every write to
-			// the display happens on the event-loop goroutine.
-			t.messageBus <- agent.Event{Kind: agent.EvToolApproval, Tool: name, Args: args}
-			return t.askApproval()
-		},
 		EventSink: func(ev agent.Event) {
 			select {
 			case t.messageBus <- ev:

@@ -21,7 +21,7 @@ const (
 // Closing delimiters. Providers disagree: most send </think>, but several
 // send the same tag without the slash, so both have to be recognised or the
 // filter misses the end of a block and swallows the whole answer.
-var thinkCloseTags = []string{thinkClose, "</think>"}
+var thinkCloseTags = []string{thinkClose, "<think>"}
 
 // thinkTag pairs a delimiter with what it means.
 type thinkTag struct {

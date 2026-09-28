@@ -6,14 +6,13 @@ import (
 )
 
 // handleLine processes a submitted line: either a slash command or a prompt.
+//
+// The line always carries the composer's contents: the caller reads them under
+// the mutex and hands them over, so nothing here touches the input state.
+// Reading it again would race the goroutine still taking keystrokes, and
+// clearing it would eat a keystroke that landed in between.
 func (t *TUI) handleLine(line string) error {
-	text := strings.TrimSpace(joinLines(t.inputLines))
-	if line != "" {
-		text = strings.TrimSpace(line)
-	}
-	t.inputLines = []string{""}
-	t.cursorLine, t.cursorCol = 0, 0
-
+	text := strings.TrimSpace(line)
 	if text == "" {
 		return nil
 	}
@@ -27,7 +26,10 @@ func (t *TUI) handleLine(line string) error {
 
 // overlayOpen reports whether any full-panel overlay is showing. The command
 // palette is not one of them: it is a completion list for the composer, and it
-// only makes sense while the composer is being typed into.
+// only makes sense while the composer is being typed into. The live diff panel
+// is not an overlay: it comes up on its own after an edit and renders above the
+// prompt, so it does not block other views from opening. It is asked for keys
+// separately, and only claims the ones it can act on.
 func (t *TUI) overlayOpen() bool {
 	return t.subViewOpen() || t.editViewerOpen() || t.modelPickerOpen()
 }
@@ -53,6 +55,13 @@ func (t *TUI) onKey(k string) {
 			return
 		}
 	}
+	if t.liveDiffOpen() {
+		if handled := t.liveDiffKey(k); handled {
+			t.mu.Unlock()
+			t.scheduleDraw()
+			return
+		}
+	}
 	if t.modelPickerOpen() {
 		if done := t.modelPickerKey(k); done {
 			t.mu.Unlock()
@@ -71,9 +80,7 @@ func (t *TUI) onKey(k string) {
 			}
 			t.mu.Unlock()
 			if run != "" {
-				if err := t.runCommand(run); err != nil {
-					t.lastErr = err
-				}
+				t.submitLine(run)
 			}
 			t.scheduleDraw()
 			return
@@ -92,18 +99,18 @@ func (t *TUI) onKey(k string) {
 			t.inputLines = []string{""}
 			t.cursorLine, t.cursorCol = 0, 0
 			t.asking = false
-			question := t.question
-			t.question = ""
+			// Take the channel the question published, and forget it: the next
+			// question publishes a fresh one. A channel left behind here keeps
+			// its reader parked, and the agent waits for an answer that has
+			// already been typed.
+			ch := t.pendingAnswer
+			t.pendingAnswer = nil
 			t.mu.Unlock()
-			// Route the answer to whichever flow is waiting. An ask_user
-			// question is pending on pendingAnswer; a tool approval waits on
-			// answerChan.
-			if t.pendingAnswer != nil {
-				t.pendingAnswer <- ans
-			} else if t.answerChan != nil {
-				t.answerChan <- ans
+			// Buffered, so this never parks the key handler. Nil when the
+			// question was raised by something that has since gone away.
+			if ch != nil {
+				ch <- ans
 			}
-			_ = question
 			t.scheduleDraw()
 			return
 		}
@@ -111,9 +118,7 @@ func (t *TUI) onKey(k string) {
 		t.inputLines = []string{""}
 		t.cursorLine, t.cursorCol = 0, 0
 		t.mu.Unlock()
-		if err := t.handleLine(text); err != nil {
-			t.lastErr = err
-		}
+		t.submitLine(text)
 		t.scheduleDraw()
 		return
 	case "newline":
@@ -232,7 +237,7 @@ func (t *TUI) onKey(k string) {
 		}
 	case "tab":
 		// accept completion if any
-		if comp := t.completeCommand(); comp != "" {
+		if comp := t.completeCommand(); comp != "" && len(t.inputLines) > 0 {
 			t.inputLines[0] = comp + " "
 			t.cursorCol = countRunes(t.inputLines[0])
 		}
@@ -243,37 +248,49 @@ func (t *TUI) onKey(k string) {
 	default:
 		// treat unknown alt combos as literal
 		if strings.HasPrefix(k, "alt,") {
-			t.insertText(k[4:])
+			// t.mu is held across this switch, so the locked-out insert is
+			// the only one that can run here: insertText would take the same
+			// non-reentrant mutex again and wedge the input goroutine for
+			// good, leaving the terminal in raw mode with no way out but a
+			// kill -9.
+			t.insertTextLocked(k[4:])
 		}
 	}
 	t.mu.Unlock()
 	t.scheduleDraw()
 }
 
-// askApproval blocks the agent until the user answers a risky tool call.
+// submitLine hands a finished line to the event loop.
 //
-// It runs on the agent's goroutine while the key handler runs on the event
-// loop, so the answer channel is published under the mutex rather than
-// assigned in place.
-func (t *TUI) askApproval() bool {
-	t.mu.Lock()
-	answers := make(chan string, 1)
-	t.answerChan = answers
-	t.asking = true
-	t.question = "approve this tool call? (y/n)"
-	t.mu.Unlock()
-	t.scheduleDraw()
-
-	select {
-	case ans := <-answers:
-		t.mu.Lock()
-		t.asking = false
-		t.question = ""
-		t.mu.Unlock()
-		return strings.HasPrefix(strings.ToLower(strings.TrimSpace(ans)), "y")
-	case <-t.done:
-		return false
+// The loop is the only goroutine allowed to touch the display buffer: a
+// command run from the input goroutine appends to app.history while the loop
+// is reading that same slice to commit it, which is a torn read at best. It
+// is also where the sticky error and the streaming state live, so a turn
+// started from the reader raced every repaint.
+//
+// Outside a run loop there is nothing to hand the line to and it is handled
+// here.
+func (t *TUI) submitLine(line string) {
+	if t.submissions != nil {
+		select {
+		case t.submissions <- line:
+		case <-t.done:
+		}
+		return
 	}
+	if err := t.handleLine(line); err != nil {
+		t.setLastErr(err)
+	}
+}
+
+// setLastErr records the sticky error shown on the top rail.
+func (t *TUI) setLastErr(err error) {
+	if err == nil {
+		return
+	}
+	t.mu.Lock()
+	t.lastErr = err
+	t.mu.Unlock()
 }
 
 // Quit exits the application.
@@ -318,7 +335,7 @@ func removeLine(l []string, at int) []string {
 }
 
 func (t *TUI) completeCommand() string {
-	if len(t.inputLines) == 0 {
+	if len(t.inputLines) == 0 || t.cursorLine < 0 || t.cursorLine >= len(t.inputLines) {
 		return ""
 	}
 	return completeCommand(t.inputLines[t.cursorLine], t.app)

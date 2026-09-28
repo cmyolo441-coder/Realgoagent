@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -32,6 +33,7 @@ type ContentPart struct {
 type ToolCall struct {
 	ID       string `json:"id"`
 	Type     string `json:"type"`
+	Index    int    `json:"index"`
 	Function struct {
 		Name      string `json:"name"`
 		Arguments string `json:"arguments"`
@@ -126,6 +128,16 @@ func NewClient(baseURL, apiKey, model string) *Client {
 	}
 }
 
+// httpError carries an HTTP status code for proper error classification.
+type httpError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *httpError) Error() string {
+	return fmt.Sprintf("unexpected status %d: %s", e.StatusCode, e.Body)
+}
+
 // Stream sends req and returns a channel of chunks. The channel is closed on
 // completion. The caller must drain it fully.
 func (c *Client) Stream(ctx context.Context, req Request) <-chan Chunk {
@@ -156,7 +168,10 @@ func (c *Client) Stream(ctx context.Context, req Request) <-chan Chunk {
 							return
 						}
 					case <-ctx.Done():
-						out <- Chunk{Err: ctx.Err()}
+						select {
+						case out <- Chunk{Err: ctx.Err()}:
+						default:
+						}
 						return
 					}
 				}
@@ -200,17 +215,20 @@ func retryable(err error) bool {
 	if err == nil {
 		return false
 	}
-	s := err.Error()
-	for _, needle := range []string{"429", "500", "502", "503", "504", "timeout", "EOF", "connection reset"} {
-		if strings.Contains(s, needle) {
-			return true
-		}
+	var he *httpError
+	if errors.As(err, &he) {
+		return he.StatusCode == 429 || he.StatusCode >= 500
 	}
-	return strings.Contains(s, "unexpected status 5")
+	s := err.Error()
+	return strings.Contains(s, "timeout") || strings.Contains(s, "EOF") || strings.Contains(s, "connection reset")
 }
 
 // isRateLimit reports whether err is a 429 so the caller can slow down.
 func isRateLimit(err error) bool {
+	var he *httpError
+	if errors.As(err, &he) {
+		return he.StatusCode == 429
+	}
 	return err != nil && strings.Contains(err.Error(), "429")
 }
 
@@ -235,68 +253,141 @@ func (c *Client) doStream(ctx context.Context, req Request) (<-chan Chunk, error
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		defer resp.Body.Close()
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("unexpected status %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+		return nil, &httpError{StatusCode: resp.StatusCode, Body: strings.TrimSpace(string(b))}
 	}
+	// Captured for the "no data at all" diagnostic below: a 200 carrying an
+	// HTML error page or an empty body is the common shape of a misconfigured
+	// base URL, and the status alone does not say so.
+	httpResp := &http.Response{StatusCode: resp.StatusCode, Header: resp.Header.Clone()}
 
 	out := make(chan Chunk, 64)
 	go func() {
 		defer close(out)
 		defer resp.Body.Close()
 
+		// send is the reader's only way out. Every send is paired with a
+		// select on ctx so a consumer that walks away — Esc, a tool error, a
+		// retry — cannot park this goroutine on a full channel: a parked
+		// reader holds the response body, the TCP connection and a slot in the
+		// transport's pool, and nothing ever wakes it.
+		send := func(c Chunk) bool {
+			select {
+			case out <- c:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
+
 		br := bufio.NewReaderSize(resp.Body, 1<<16)
 		var event string
-		for {
-			line, err := br.ReadString('\n')
+		// A data: payload that does not parse on its own is held rather than
+		// dropped, so a JSON body split across two data: lines is reassembled
+		// instead of silently losing the frame.
+		var partial string
+		delivered := false
+		sawDone := false
+
+		// frame handles one complete event payload.
+		frame := func(data string) bool {
+			if data == "[DONE]" {
+				sawDone = true
+				send(Chunk{Done: true})
+				return false
+			}
+			chunk, err := parseChunk(data)
 			if err != nil {
-				if err != io.EOF {
-					out <- Chunk{Err: err}
+				return true // heartbeats / keep-alives / unparseable
+			}
+			chunk.Raw = event + ":" + data
+			event = ""
+			delivered = true
+			if !send(chunk) {
+				return false
+			}
+			return !chunk.Done
+		}
+
+		for {
+			line, rerr := br.ReadString('\n')
+			// A stream may end without a trailing newline. The bytes already
+			// read are a complete event and must be parsed, not discarded.
+			last := rerr != nil
+			if last {
+				if rerr != io.EOF {
+					send(Chunk{Err: rerr})
+					return
 				}
-				return
+				if line == "" {
+					// Nothing left to read. A 200 that carried no frame at all
+					// is a failed response, not an empty reply: reporting it as
+					// success would end the turn silently with no text and no
+					// error for the user to see.
+					if !delivered && !sawDone {
+						send(Chunk{Err: fmt.Errorf("stream ended before any data (%s)", streamStatus(httpResp))})
+					}
+					return
+				}
 			}
 			line = strings.TrimRight(line, "\r\n")
-			if line == "" {
-				continue
-			}
+
 			switch {
+			case line == "":
+				// Event boundary. Anything still buffered was an unparseable
+				// prefix, not a split frame; drop it rather than carrying it
+				// into the next event.
+				partial = ""
 			case strings.HasPrefix(line, ":"):
-				continue
+				// comment / keep-alive
 			case strings.HasPrefix(line, "event:"):
 				event = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
-				continue
 			case strings.HasPrefix(line, "data:"):
 				data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 				if data == "" {
 					continue
 				}
-				if data == "[DONE]" {
-					out <- Chunk{Done: true}
-					return
+				if partial != "" {
+					// A data: field may span several lines; SSE joins them
+					// with a newline, which is exactly what JSON needs.
+					data = partial + "\n" + data
+					partial = ""
 				}
-				chunk, err := parseChunk(data)
-				if err != nil {
-					continue // tolerate heartbeats / keep-alives
+				// Try the payload as it stands. Only if it is not yet valid
+				// JSON is it held for the next data: line.
+				if !json.Valid([]byte(data)) {
+					partial = data
+					if last {
+						return
+					}
+					continue
 				}
-				chunk.Raw = event + ":" + data
-				event = ""
-				out <- chunk
-				if chunk.Done {
+				if !frame(data) {
 					return
 				}
 			default:
 				// Some servers emit raw JSON without the data: prefix.
 				if strings.HasPrefix(line, "{") {
-					chunk, err := parseChunk(line)
-					if err == nil {
-						out <- chunk
-						if chunk.Done {
-							return
-						}
+					if !frame(line) {
+						return
 					}
 				}
+			}
+			if last {
+				return
 			}
 		}
 	}()
 	return out, nil
+}
+
+// streamStatus describes a 200 response for a diagnostic, so an empty stream
+// can say what it actually was.
+func streamStatus(r *http.Response) string {
+	ct := r.Header.Get("Content-Type")
+	if ct == "" {
+		return fmt.Sprintf("status %d, no content-type", r.StatusCode)
+	}
+	return fmt.Sprintf("status %d, content-type %s", r.StatusCode, ct)
 }
 
 func parseChunk(data string) (Chunk, error) {
@@ -351,6 +442,12 @@ func Collect(ch <-chan Chunk) (Message, *Usage, error) {
 
 // mergeToolCall merges streamed tool-call fragments into the message.
 func mergeToolCall(m *Message, tc ToolCall) {
+	// Use Index to find the right tool call slot (OpenAI streaming format).
+	if tc.Index < len(m.ToolCalls) {
+		appendToolFragment(&m.ToolCalls[tc.Index], tc)
+		return
+	}
+	// Fallback: match by ID for providers that don't send Index.
 	if tc.ID != "" {
 		for i := range m.ToolCalls {
 			if m.ToolCalls[i].ID == tc.ID {
@@ -358,18 +455,10 @@ func mergeToolCall(m *Message, tc ToolCall) {
 				return
 			}
 		}
-		cp := tc
-		cp.Type = "function"
-		m.ToolCalls = append(m.ToolCalls, cp)
-		return
 	}
-	// fragment without id: attach to last known index
-	if len(m.ToolCalls) > 0 {
-		appendToolFragment(&m.ToolCalls[len(m.ToolCalls)-1], tc)
-		return
-	}
-	// index-based fragment
-	m.ToolCalls = append(m.ToolCalls, tc)
+	cp := tc
+	cp.Type = "function"
+	m.ToolCalls = append(m.ToolCalls, cp)
 }
 
 func appendToolFragment(dst *ToolCall, src ToolCall) {

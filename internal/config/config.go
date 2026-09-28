@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 )
 
 // Provider describes an OpenAI-compatible LLM endpoint.
@@ -30,12 +31,80 @@ type Model struct {
 	Reasoner bool   `json:"reasoner,omitempty"`
 }
 
+// OutputLimit is the largest completion the model can produce, falling back to
+// defaultMaxOutput when the config does not state one. The number doubles as
+// the request ceiling, so a generous value is safe: a provider that caps lower
+// simply stops streaming early, whereas a value set too low truncates the
+// answer mid-sentence.
+func (m *Model) OutputLimit() int {
+	if m == nil || m.MaxOut <= 0 {
+		return defaultMaxOutput
+	}
+	return m.MaxOut
+}
+
+const (
+	// defaultMaxOutput is assumed when a model declares no max_output. It is
+	// high enough that a normal agent turn never truncates, and the
+	// context-window clamp in MaxOutputTokens keeps it reachable.
+	defaultMaxOutput = 32768
+
+	// contextMarginTokens is headroom kept free inside the context window so the
+	// request carries slack for the provider's own framing, tokenizer drift and
+	// reasoning tokens the estimate cannot see. Without it a prompt estimated
+	// at exactly the window size is rejected as too long.
+	contextMarginTokens = 8192
+
+	// minOutputTokens is the floor applied after clamping. A prompt can fill
+	// the whole window on its own; asking for a token or two is still refused,
+	// but it fails fast and predictably instead of sending a nonsensical budget.
+	minOutputTokens = 256
+)
+
+// EstimateTokens approximates a token count for s without a tokenizer. English
+// prose and source code both land near four characters per token, which is
+// accurate enough to keep a request inside the context window.
+func EstimateTokens(s string) int {
+	if s == "" {
+		return 0
+	}
+	return (len(s) + 3) / 4
+}
+
+// MaxOutputTokens returns the max_tokens to request from m when the prompt is
+// about promptTokens tokens long.
+//
+// Config.MaxTokens is an optional ceiling: set it to cap output across models,
+// leave it at zero to let each model use its own limit. Either way the result
+// is clamped to the space left in the model's context window, so a long
+// conversation narrows the answer instead of overrunning the window.
+func (c *Config) MaxOutputTokens(m *Model, promptTokens int) int {
+	if m == nil {
+		if c.MaxTokens > 0 {
+			return c.MaxTokens
+		}
+		return defaultMaxOutput
+	}
+	limit := m.OutputLimit()
+	if c.MaxTokens > 0 && c.MaxTokens < limit {
+		limit = c.MaxTokens
+	}
+	if m.Context > 0 {
+		if room := m.Context - promptTokens - contextMarginTokens; room < limit {
+			limit = room
+		}
+	}
+	if limit < minOutputTokens {
+		limit = minOutputTokens
+	}
+	return limit
+}
+
 // Config is the root configuration document.
 type Config struct {
 	DefaultModel  string            `json:"default_model,omitempty"`
 	Providers     []Provider        `json:"providers"`
 	Theme         string            `json:"theme,omitempty"`
-	AutoApprove   bool              `json:"auto_approve,omitempty"`
 	MaxIterations int               `json:"max_iterations,omitempty"`
 	Temperature   float64           `json:"temperature,omitempty"`
 	MaxTokens     int               `json:"max_tokens,omitempty"`
@@ -44,7 +113,8 @@ type Config struct {
 	MCP           []MCPConfig       `json:"mcp,omitempty"`
 	Prompt        PromptConfig      `json:"prompt,omitempty"`
 
-	path string `json:"-"`
+	path     string
+	pathOnce sync.Once
 }
 
 // PromptConfig controls interactive prompt behaviour.
@@ -102,39 +172,28 @@ func Default() *Config {
 		Theme:         "nova",
 		MaxIterations: 60,
 		Temperature:   0.6,
-		MaxTokens:     8192,
-		AutoApprove:   false,
+		// Zero means "no global ceiling": each request is sized from the active
+		// model's own output limit and its remaining context window.
+		MaxTokens:   0,
 		Providers: []Provider{
 			{
 				Name:    "kiosai",
 				Kind:    "openai",
 				BaseURL: "https://kiosapi.com/v1",
-				APIKey:  "sk-cFXQ576lsIctpudkYD5lPniF5UgHGLy1nKeXDscCEvK1LMZV",
 				Enabled: true,
 				Models: []Model{
-					{ID: "muse-spark-1.3-contributor", Alias: "muse", Context: 262144},
-					{ID: "grok-4.7-free", Alias: "grok", Context: 262144, Reasoner: true},
-					{ID: "deepseek-v4.1-flash-free", Alias: "deepseek", Context: 128000},
-					{ID: "space-bunny-alpha", Alias: "bunny", Context: 262144},
-				},
-			},
-			{
-				Name:    "inferera",
-				Kind:    "openai",
-				BaseURL: "https://api.inferera.com/v1",
-				APIKey:  "sk-TPfzw5EFzUZOAhGB58D46702447b4e45BbF588B07eF1Bf20",
-				Enabled: true,
-				Models: []Model{
-					{ID: "coding-kimi-k3-free", Alias: "kimi", Context: 262144, Reasoner: false},
-					{ID: "union-alpha-free", Alias: "union", Context: 262144},
-					{ID: "xiaomi-mimo-v2.6-pro-free", Alias: "mimo", Context: 262144},
+					{ID: "muse-spark-1.3-contributor", Alias: "muse", Context: 262144, MaxOut: 131072},
+					{ID: "grok-4.7-free", Alias: "grok", Context: 262144, MaxOut: 131072, Reasoner: true},
+					{ID: "deepseek-v4.1-flash-free", Alias: "deepseek", Context: 131072, MaxOut: 65536},
+					{ID: "space-bunny-alpha", Alias: "bunny", Context: 262144, MaxOut: 131072},
+					{ID: "longcat-2.5-preview", Alias: "longcat", Context: 262144, MaxOut: 131072},
+					{ID: "mimo-v2.6-flash", Alias: "mimo", Context: 262144, MaxOut: 131072},
 				},
 			},
 			{
 				Name:    "stepfun",
 				Kind:    "openai",
 				BaseURL: "https://api.stepfun.ai/step_plan/v1",
-				APIKey:  "1fLhqREkwguf6zoWaiD4we3Y7TObp7kk0qYNH1y1kUf6MsjOU91fvOjgN52RFCr4i",
 				Enabled: true,
 				Models: []Model{
 					{ID: "step-5-preview", Alias: "step", Context: 1000000, MaxOut: 65536, Vision: true},
@@ -185,7 +244,7 @@ func Load() (*Config, error) {
 			c := Default()
 			c.path = p
 			if err := c.Save(); err != nil {
-				return c, nil
+				return c, err
 			}
 			return c, nil
 		}
@@ -205,17 +264,18 @@ func Load() (*Config, error) {
 	if c.Temperature <= 0 {
 		c.Temperature = 0.6
 	}
-	if c.MaxTokens <= 0 {
-		c.MaxTokens = 8192
-	}
+	// MaxTokens is intentionally left alone: zero means "size each request from
+	// the model", and a stale value from an older config is clamped per request.
 	return c, nil
 }
 
 // Save writes the config atomically with 0600 permissions (contains API keys).
 func (c *Config) Save() error {
-	if c.path == "" {
-		c.path = Path()
-	}
+	c.pathOnce.Do(func() {
+		if c.path == "" {
+			c.path = Path()
+		}
+	})
 	if err := os.MkdirAll(filepath.Dir(c.path), 0o700); err != nil {
 		return err
 	}
@@ -245,9 +305,11 @@ func (c *Config) Save() error {
 
 // Path returns the config file location.
 func (c *Config) Path() string {
-	if c.path == "" {
-		c.path = Path()
-	}
+	c.pathOnce.Do(func() {
+		if c.path == "" {
+			c.path = Path()
+		}
+	})
 	return c.path
 }
 
@@ -264,6 +326,9 @@ func (c *Config) ResolveModel(ref string) (*Provider, *Model, error) {
 			if !strings.EqualFold(c.Providers[i].Name, pn) {
 				continue
 			}
+			if !c.Providers[i].Enabled {
+				return nil, nil, fmt.Errorf("provider %q is disabled", pn)
+			}
 			if m := c.Providers[i].FindModel(mid); m != nil {
 				return &c.Providers[i], m, nil
 			}
@@ -273,6 +338,9 @@ func (c *Config) ResolveModel(ref string) (*Provider, *Model, error) {
 	}
 	// bare model id or alias across providers
 	for i := range c.Providers {
+		if !c.Providers[i].Enabled {
+			continue
+		}
 		if m := c.Providers[i].FindModel(ref); m != nil {
 			return &c.Providers[i], m, nil
 		}

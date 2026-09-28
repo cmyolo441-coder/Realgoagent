@@ -13,12 +13,10 @@ import (
 type Mode int
 
 const (
-	// ModeAgent is the default: the model may use tools.
+	// ModeAgent is the default: the model may use every tool.
 	ModeAgent Mode = iota
 	// ModePlan restricts the agent to read-only tools.
 	ModePlan
-	// ModeAcceptEdits auto-approves file edits.
-	ModeAcceptEdits
 )
 
 // App wires the TUI to the agent and config.

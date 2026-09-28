@@ -22,6 +22,13 @@ func (t *TUI) draw() {
 	if t.app == nil {
 		return
 	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.drawLocked()
+}
+
+// drawLocked is draw with t.mu held.
+func (t *TUI) drawLocked() {
 	p := t.app.Theme
 	w := t.app.Width
 	if w < 24 {
@@ -34,7 +41,7 @@ func (t *TUI) draw() {
 
 	// Anything the agent or a command appended is finished output: print it
 	// once, permanently, and the terminal owns it from then on.
-	t.commitHistory(w)
+	t.commitHistoryLocked(w)
 
 	// The live region must never be taller than the screen, or writing its
 	// last row scrolls the terminal and the offsets stop lining up. One row is
@@ -108,6 +115,13 @@ func (t *TUI) draw() {
 // yet. The live region is torn down first so the new output lands directly
 // above it instead of interleaving with it.
 func (t *TUI) commitHistory(w int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.commitHistoryLocked(w)
+}
+
+// commitHistoryLocked is commitHistory with t.mu held.
+func (t *TUI) commitHistoryLocked(w int) {
 	all := t.app.history.Lines()
 	if len(all) < t.flushed {
 		// The buffer was cleared under us. Forget the old bookkeeping rather
@@ -120,7 +134,7 @@ func (t *TUI) commitHistory(w int) {
 	if len(all) == t.flushed {
 		return
 	}
-	t.eraseLive()
+	t.eraseLiveLocked()
 	for _, ln := range all[t.flushed:] {
 		line := util.Truncate(ln, w)
 		t.out.WriteString(line)
@@ -138,6 +152,8 @@ func (t *TUI) commitHistory(w int) {
 // it on the caret, which sits inside the box. Stepping up from there would
 // overshoot into committed history, so the region is left from the bottom
 // row instead.
+//
+// Called with t.mu held.
 func (t *TUI) moveToLiveTop(b *strings.Builder) {
 	if t.liveLines <= 0 {
 		return
@@ -163,8 +179,9 @@ func (t *TUI) moveToLiveTop(b *strings.Builder) {
 	t.caretRowLast = 0
 }
 
-// eraseLive removes the repainted region so output can be written in its place.
-func (t *TUI) eraseLive() {
+// eraseLiveLocked removes the repainted region so output can be written in its place.
+// Called with t.mu held.
+func (t *TUI) eraseLiveLocked() {
 	var b strings.Builder
 	t.moveToLiveTop(&b)
 	b.WriteString("\x1b[J")
@@ -233,6 +250,8 @@ func (t *TUI) hint(p theme.Palette) string {
 			return "↑↓ scroll · PgUp/PgDn jump · ⏎ back · esc close"
 		}
 		return "↑↓ move · ⏎ expand diff · PgUp/PgDn jump · esc close"
+	case t.liveDiffOpen():
+		return "↑↓ scroll · esc dismiss"
 	case t.modelPickerOpen():
 		return "↑↓ move · PgUp/PgDn jump · ⏎ switch model · esc close"
 	case t.paletteLen() > 0:
@@ -253,6 +272,9 @@ func (t *TUI) topRail(p theme.Palette) string {
 		rail := p.Style("accent", spinFrame()) + " working…"
 		if t.toolActive != "" {
 			rail += "  " + p.Style("tool", t.toolActive)
+		}
+		if t.liveDiff != nil && t.liveDiff.streaming && t.liveDiff.streamPath != "" {
+			rail += "  " + p.Style("text", truncMiddle(t.liveDiff.streamPath, 40))
 		}
 		if t.activeTask != "" {
 			rail += "  " + p.Style("accent2", truncMiddle(t.activeTask, 40))
@@ -282,11 +304,8 @@ func (t *TUI) bottomRail(p theme.Palette) string {
 }
 
 func modeDot(m Mode) string {
-	switch m {
-	case ModePlan:
+	if m == ModePlan {
 		return " · plan"
-	case ModeAcceptEdits:
-		return " · auto-edit"
 	}
 	return ""
 }

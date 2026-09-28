@@ -71,7 +71,6 @@ Tool rules:
 - Call independent tools in parallel in a single message to move faster.
 - After any change, run the project's build/test command and fix failures before reporting success.
 - If a command fails, read the error, form a hypothesis, and iterate. Never give up after one attempt.
-- Never run destructive commands (rm -rf, git reset --hard, force push, dropping data) without asking via ask_user.
 - Respect repository instruction files and match local conventions, naming and formatting.
 - Keep changes in scope. Do not add unrequested dependencies, features or abstractions.`
 
@@ -97,7 +96,7 @@ func LoadInstructionFiles(workspace string, maxBytes int) []string {
 		if err != nil {
 			continue
 		}
-		if len(data) > maxBytes {
+		if maxBytes >= 0 && len(data) > maxBytes {
 			data = data[:maxBytes]
 		}
 		out = append(out, fmt.Sprintf("## %s\n\n%s", n, strings.TrimSpace(string(data))))

@@ -264,14 +264,21 @@ func align(old, new []string, oldAt, newAt int) []Line {
 }
 
 // splitLines splits into lines, dropping the empty element a trailing newline
-// produces so "a\n" and "a" compare equal.
+// produces so "a\n" and "a" compare equal. CRLF endings are normalised first
+// so Windows-style text does not carry a stray \r on every line.
 func splitLines(s string) []string {
 	if s == "" {
 		return nil
 	}
+	s = strings.ReplaceAll(s, "\r\n", "\n")
 	lines := strings.Split(s, "\n")
 	if n := len(lines); n > 0 && lines[n-1] == "" {
 		lines = lines[:n-1]
+	}
+	// A lone "\n" leaves a single empty line behind; treat it as zero lines
+	// so it compares equal to "" — a file holding nothing is nothing.
+	if len(lines) == 1 && lines[0] == "" {
+		return nil
 	}
 	return lines
 }
@@ -291,13 +298,31 @@ func Unified(path, before, after string, context int) string {
 	// Each hunk is buffered before it is written, because its header carries
 	// line ranges that are only known once the whole hunk has been read.
 	body := make([]string, 0, len(lines))
-	oldStart, newStart, oldCount, newCount := 0, 0, 0, 0
+	oldCount, newCount := 0, 0
+	// hunkOldStart and hunkNewStart are the 1-based line numbers the hunk
+	// ranges start at. Zero means "not yet seen a line from that side", which
+	// is how a pure insertion (no old line) or pure deletion (no new line)
+	// is detected once the hunk is complete.
+	var hunkOldStart, hunkNewStart int
 	// open reports whether a hunk is being accumulated. A gap marker sets it
 	// false, because an elided region ends the hunk.
 	open := false
 	flush := func() {
 		if !open {
 			return
+		}
+		oldStart, newStart := hunkOldStart, hunkNewStart
+		if oldStart == 0 {
+			// A hunk with no old line is a pure insertion: its old range is
+			// empty and the start is the line before which the new lines
+			// land, the convention git uses as well.
+			oldStart = newStart - 1
+		}
+		if newStart == 0 {
+			// A hunk with no new line is a pure deletion: its new range is
+			// empty and the start is the line before which the old lines
+			// were removed.
+			newStart = oldStart - 1
 		}
 		fmt.Fprintf(&b, "@@ -%s +%s @@\n", rangeSpec(oldStart, oldCount), rangeSpec(newStart, newCount))
 		for _, l := range body {
@@ -315,22 +340,27 @@ func Unified(path, before, after string, context int) string {
 		if !open {
 			open = true
 			oldCount, newCount = 0, 0
-			// The range starts at the first old/new line the hunk touches. An
-			// insertion has no old line to anchor on, so it takes its number
-			// from the new side — the convention git uses as well.
-			if l.Old > 0 {
-				oldStart, newStart = l.Old, l.New
-			} else {
-				oldStart, newStart = l.New, l.New
-			}
+			hunkOldStart, hunkNewStart = 0, 0
 		}
 		switch l.Op {
 		case OpEqual:
+			if hunkOldStart == 0 {
+				hunkOldStart = l.Old
+			}
+			if hunkNewStart == 0 {
+				hunkNewStart = l.New
+			}
 			oldCount++
 			newCount++
 		case OpDel:
+			if hunkOldStart == 0 {
+				hunkOldStart = l.Old
+			}
 			oldCount++
 		case OpAdd:
+			if hunkNewStart == 0 {
+				hunkNewStart = l.New
+			}
 			newCount++
 		}
 		body = append(body, string(l.Op)+l.Text)
@@ -339,11 +369,11 @@ func Unified(path, before, after string, context int) string {
 	return b.String()
 }
 
-// rangeSpec formats a hunk range. A zero count is written as "0,0" the way
-// git writes it, because that is what every diff reader expects to parse.
+// rangeSpec formats a hunk range. A zero count is written as "start,0" the
+// way git writes it, because that is what every diff reader expects to parse.
 func rangeSpec(start, count int) string {
 	if count == 0 {
-		return "0,0"
+		return fmt.Sprintf("%d,0", start)
 	}
 	return fmt.Sprintf("%d,%d", start, count)
 }

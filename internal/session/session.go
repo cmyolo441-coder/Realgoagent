@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nova-ai/nova/internal/config"
@@ -24,6 +25,8 @@ type Session struct {
 	Title     string        `json:"title"`
 	Messages  []llm.Message `json:"messages"`
 	Usage     llm.Usage     `json:"usage,omitempty"`
+
+	mu sync.Mutex
 }
 
 // Dir returns the session directory.
@@ -52,25 +55,50 @@ func randSuffix() string {
 	return string(b)
 }
 
-// Save writes the session to disk.
+// Save writes the session to disk atomically.
 func (s *Session) Save() error {
 	if err := os.MkdirAll(Dir(), 0o700); err != nil {
 		return err
 	}
+	s.mu.Lock()
 	s.UpdatedAt = time.Now()
 	data, err := json.MarshalIndent(s, "", "  ")
+	s.mu.Unlock()
 	if err != nil {
 		return err
 	}
 	path := filepath.Join(Dir(), s.ID+".json")
-	return os.WriteFile(path, data, 0o600)
+	return atomicWriteFile(path, data, 0o600)
+}
+
+// validateID rejects IDs containing path separators or parent directory
+// references, which would escape the sessions directory via filepath.Join.
+func validateID(id string) error {
+	if id == "" {
+		return fmt.Errorf("session id must not be empty")
+	}
+	if strings.ContainsRune(id, '/') || strings.ContainsRune(id, '\\') || strings.ContainsRune(id, os.PathSeparator) {
+		return fmt.Errorf("invalid session id %q", id)
+	}
+	if strings.Contains(id, "..") {
+		return fmt.Errorf("invalid session id %q", id)
+	}
+	return nil
 }
 
 // Path returns the on-disk location of the session.
-func (s *Session) Path() string { return filepath.Join(Dir(), s.ID+".json") }
+func (s *Session) Path() string {
+	if err := validateID(s.ID); err != nil {
+		return ""
+	}
+	return filepath.Join(Dir(), s.ID+".json")
+}
 
 // Load reads a session by ID.
 func Load(id string) (*Session, error) {
+	if err := validateID(id); err != nil {
+		return nil, err
+	}
 	data, err := os.ReadFile(filepath.Join(Dir(), id+".json"))
 	if err != nil {
 		return nil, err
@@ -144,6 +172,9 @@ func List() ([]*Session, error) {
 
 // Delete removes a session file.
 func Delete(id string) error {
+	if err := validateID(id); err != nil {
+		return err
+	}
 	return os.Remove(filepath.Join(Dir(), id+".json"))
 }
 
@@ -153,10 +184,37 @@ func (s *Session) Summary() string {
 	if title == "" {
 		title = firstUserMessage(s.Messages)
 	}
-	if len(title) > 60 {
-		title = title[:57] + "..."
+	runes := []rune(title)
+	if len(runes) > 60 {
+		title = string(runes[:57]) + "..."
 	}
 	return fmt.Sprintf("%s  %s  %s  %s", s.ID, s.UpdatedAt.Format("Jan 02 15:04"), s.Model, title)
+}
+
+// atomicWriteFile writes data to path atomically by writing to a temporary
+// file in the same directory first, then renaming it over the destination.
+// This prevents partial writes from corrupting existing session files.
+func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".tmp-session-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 func firstUserMessage(msgs []llm.Message) string {

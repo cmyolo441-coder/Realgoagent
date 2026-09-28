@@ -143,8 +143,10 @@ func relPath(full string) string {
 
 // patchPathRe matches the "+++ b/<path>" and "--- a/<path>" headers of a
 // unified diff. Both are captured so a pure-deletion patch, which has no added
-// line at all, is still attributed to the right file.
-var patchPathRe = regexp.MustCompile(`^(?:\+\+\+|---)\s+(?:[ab]/)?(.+?)\s*$`)
+// line at all, is still attributed to the right file. The path capture stops
+// at the first tab so that trailing timestamps (e.g. "file\t2024-01-01 ...")
+// are excluded from the path.
+var patchPathRe = regexp.MustCompile(`^(?:\+\+\+|---)\s+(?:[ab]/)?([^\t]+?)\s*$`)
 
 // PatchPaths returns the files a unified diff would touch.
 //

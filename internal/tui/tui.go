@@ -42,17 +42,17 @@ type TUI struct {
 	toolActive string
 	activeTask string
 
-	// pending confirmation
+	// asking is set while the agent is blocked on an ask_user question, and
+	// the composer is routed to answering it instead of sending a new turn.
 	asking   bool
 	question string
 
 	// iteration counter for the current turn
 	iter int
 
-	// answerChan receives the typed answer to a tool approval prompt.
-	answerChan chan string
 	// pendingAnswer receives the typed answer to an ask_user question. It is
-	// kept separate from answerChan so the two flows cannot swallow each other.
+	// published under the mutex because the agent's goroutine parks on it while
+	// the key handler runs on the event loop.
 	pendingAnswer chan string
 
 	// cursor for rendering input
@@ -86,6 +86,9 @@ type TUI struct {
 	// editView is the open edit viewer, or nil when it is closed.
 	editView *editViewer
 
+	// liveDiff is the real-time diff panel that shows the latest edit's diff.
+	liveDiff *liveDiffView
+
 	// agents is the open subagent view, or nil when it is closed.
 	agents *subView
 
@@ -110,8 +113,12 @@ type TUI struct {
 	lastErr error
 
 	// redrawReq coalesces repaint requests from the key handler.
-	redrawReq  chan struct{}
-	messageBus chan agent.Event
+	redrawReq chan struct{}
+	// submissions carries finished lines from the input goroutine to the
+	// event loop, which is the only goroutine that may run a command: they
+	// write to the display buffer the loop reads on every repaint.
+	submissions chan string
+	messageBus  chan agent.Event
 }
 
 // frameInterval caps how often the screen is repainted. 20fps is smooth
@@ -129,6 +136,7 @@ func NewTUI(cfg *config.Config) (*TUI, error) {
 		redrawReq:  make(chan struct{}, 1),
 		messageBus: make(chan agent.Event, 256),
 		inputLines: []string{""},
+		liveDiff:   newLiveDiffView(),
 	}
 	if w, h, err := term.GetSize(int(os.Stdout.Fd())); err == nil {
 		app.SetSize(w, h)
@@ -181,6 +189,16 @@ func (t *TUI) Run(initialPrompt string) error {
 	signal.Notify(winch, syscall.SIGWINCH)
 	defer signal.Stop(winch)
 
+	// Raw mode means no echo and no ISIG, so a signal that ends the process
+	// without unwinding this function — a `kill` from another terminal, a
+	// supervisor giving up — would hand the user back a tty that neither
+	// echoes nor is on a line. Put the terminal back before letting the
+	// signal take the process down, then re-raise it with its default
+	// disposition so the exit status is the conventional one.
+	fatal := make(chan os.Signal, 1)
+	signal.Notify(fatal, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	defer signal.Stop(fatal)
+
 	t.resize()
 	t.printBanner()
 	// Draw once so the banner is committed and the live region has a measured
@@ -190,9 +208,9 @@ func (t *TUI) Run(initialPrompt string) error {
 	t.forceDraw()
 
 	// input reader goroutine
-	inputCh := make(chan string, 32)
+	t.submissions = make(chan string, 32)
 	errCh := make(chan error, 8)
-	go t.readInput(inputCh, errCh)
+	go t.readInput(errCh)
 
 	if initialPrompt != "" {
 		t.inputLines = strings.Split(initialPrompt, "\n")
@@ -216,7 +234,7 @@ func (t *TUI) Run(initialPrompt string) error {
 		case ev := <-t.messageBus:
 			t.handleEvent(ev)
 			t.needsDraw = true
-		case s := <-inputCh:
+		case s := <-t.submissions:
 			if err := t.handleLine(s); err != nil {
 				t.lastErr = err
 			}
@@ -224,6 +242,13 @@ func (t *TUI) Run(initialPrompt string) error {
 		case err := <-errCh:
 			t.lastErr = err
 			t.Quit()
+		case sig := <-fatal:
+			t.Exit()
+			if s, ok := sig.(syscall.Signal); ok {
+				signal.Reset(s)
+				_ = syscall.Kill(syscall.Getpid(), s)
+			}
+			return fmt.Errorf("terminated by %v", sig)
 		case <-winch:
 			t.resize()
 			t.requestPin()
@@ -263,8 +288,8 @@ func (a *App) RunWithPrompt(prompt string) error {
 //
 // The agent built by New carries no event sink and cannot ask the user
 // anything, which is right for -p and useless interactively. Re-binding it
-// here gives the session its UI: events flow to the message bus, risky tools
-// block on an approval prompt, and ask_user reaches the composer.
+// here gives the session its UI: events flow to the message bus, and ask_user
+// reaches the composer.
 func (a *App) newTUI() (*TUI, error) {
 	if a.Agent == nil {
 		return nil, fmt.Errorf("agent not initialised")
@@ -303,8 +328,10 @@ func (t *TUI) clearScreen() {
 // forceDraw repaints even when the frame is byte-identical to the last one.
 // Used after operations that invalidate our idea of the cursor position.
 func (t *TUI) forceDraw() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.lastFrame = ""
-	t.draw()
+	t.drawLocked()
 }
 
 // printBanner renders the startup header.
@@ -332,6 +359,7 @@ func (t *TUI) printBanner() {
 // reports back over the message bus, so the event loop stays responsive to
 // keystrokes while the model works.
 func (t *TUI) Submit(text string) error {
+	t.mu.Lock()
 	t.app.PromptText = text
 	t.streaming = true
 	t.iter = 0
@@ -339,6 +367,7 @@ func (t *TUI) Submit(text string) error {
 	// Esc stops the turn through this handle rather than reaching into the
 	// agent, so the key handler stays free of agent plumbing.
 	t.cancelTurn = t.app.Agent.Cancel
+	t.mu.Unlock()
 	t.scheduleDraw()
 	go func() {
 		defer func() {
@@ -371,16 +400,27 @@ func (t *TUI) send(ev agent.Event) {
 	// Blocking on the bus is safe because the event loop is the only reader
 	// and it is never blocked on the agent: every path that waits on the
 	// agent does so on the agent's own goroutine. The done case keeps a
-	// quitting session from parking this goroutine forever.
+	// quitting session from parking this goroutine forever. A timeout guards
+	// against a rare deadlock when the event loop is momentarily blocked
+	// (e.g. a shell command in /run or /diff); dropping a single text frame
+	// is preferable to hanging the agent goroutine forever.
 	select {
 	case t.messageBus <- ev:
 	case <-t.done:
+	case <-time.After(5 * time.Second):
 	}
 }
 
 // handleEvent routes agent events into the display buffer. The run loop
 // repaints once per event, so nothing here may draw.
 func (t *TUI) handleEvent(ev agent.Event) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.handleEventLocked(ev)
+}
+
+// handleEventLocked is handleEvent with t.mu held.
+func (t *TUI) handleEventLocked(ev agent.Event) {
 	p := t.app.Theme
 	switch ev.Kind {
 	case agent.EvText:
@@ -391,6 +431,10 @@ func (t *TUI) handleEvent(ev agent.Event) {
 		t.flushStream()
 		t.app.history.Append(toolCall(p, ev.Tool, md.FormatArgs(ev.Tool, ev.Args)))
 		t.toolActive = ev.Tool
+		t.clearLiveStreamLocked()
+	case agent.EvToolProgress:
+		t.toolActive = ev.Tool
+		t.updateLiveStreamLocked(streamFrame{Tool: ev.Tool, Output: ev.Output, Text: ev.Text})
 	case agent.EvToolResult:
 		t.flushStream()
 		dur := ev.Dur.Round(time.Millisecond).String()
@@ -399,15 +443,14 @@ func (t *TUI) handleEvent(ev agent.Event) {
 		}
 		t.app.history.Append(toolResult(p, ev.Tool, dur, ev.Output, ev.IsErr, t.app.Width)...)
 		t.toolActive = ""
+		t.clearLiveStreamLocked()
 		if ev.Task != "" {
 			t.activeTask = ev.Task
 		}
-	case agent.EvToolApproval:
-		t.showApproval(ev.Tool, ev.Args)
 	case agent.EvToolDenied:
 		t.app.history.Append(p.Style("warning", "⊘ denied "+ev.Tool))
 	case agent.EvAskUser:
-		t.startAsk(ev.Text)
+		t.startAskLocked(ev.Text)
 	case agent.EvIteration:
 		t.iter++
 	case agent.EvError:
@@ -428,7 +471,9 @@ func (t *TUI) handleEvent(ev agent.Event) {
 		t.toolActive = ""
 		t.iter = 0
 		t.cancelTurn = nil
+		t.clearLiveStreamLocked()
 	case agent.EvEdit:
+		t.clearLiveStreamLocked()
 		t.showEdit(ev)
 	case agent.EvUsage:
 		t.app.status = fmtUsageTokens(ev.Usage)
@@ -509,7 +554,8 @@ func (t *TUI) flushStream() {
 	t.streamBuf.Reset()
 }
 
-func (t *TUI) startAsk(q string) {
+// startAskLocked is startAsk with t.mu held.
+func (t *TUI) startAskLocked(q string) {
 	t.asking = true
 	t.question = q
 }

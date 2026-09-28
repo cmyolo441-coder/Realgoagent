@@ -25,7 +25,7 @@ func highlight(lang, line string) string {
 	case "sh", "bash", "zsh", "shell", "console":
 		return highlightShell(line)
 	case "sql":
-		return highlightShell(line)
+		return highlightSQL(line)
 	case "md", "markdown":
 		return highlightMarkdown(line)
 	}
