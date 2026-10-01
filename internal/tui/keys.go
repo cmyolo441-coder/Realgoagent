@@ -219,10 +219,22 @@ func (t *TUI) onKey(k string) {
 	case "redraw":
 		// ^L clears the display. The transcript stays in the terminal's own
 		// scrollback, so this only repaints; it does not discard history.
+		//
+		// The buffer is emptied and the read position moved to its new total.
+		// Leaving the position at zero would leave the reader behind the
+		// window's new contents, and the next paint would reprint the
+		// transcript from the top.
+		//
+		// forceDraw takes t.mu, which is held here, so the lock is dropped
+		// across it and the bookkeeping that forceDraw's own draw depends on
+		// is set before the unlock.
+		t.app.history.Clear()
+		t.flushed = t.app.history.Total()
+		t.liveLines = 0
+		t.caretRowLast = 0
+		t.lastFrame = ""
 		t.mu.Unlock()
 		t.clearScreen()
-		t.flushed = 0
-		t.app.history.Clear()
 		t.forceDraw()
 		return
 	case "ctrlc":

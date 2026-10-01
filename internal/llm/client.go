@@ -115,6 +115,11 @@ type Client struct {
 	MaxRetries int
 	// OnRetry is invoked for observability.
 	OnRetry func(attempt int, err error)
+	// OnWait is invoked before a cool-down sleep, with the length of the wait.
+	// A 429 costs twenty seconds and a transient error up to thirty, and
+	// without this the caller sees nothing at all for that whole time — the
+	// turn simply stops, which is indistinguishable from a hung program.
+	OnWait func(d time.Duration, err error)
 }
 
 // NewClient returns a client with sane defaults.
@@ -149,8 +154,12 @@ func (c *Client) Stream(ctx context.Context, req Request) <-chan Chunk {
 		var lastErr error
 		for attempt := 0; attempt <= c.MaxRetries; attempt++ {
 			if attempt > 0 {
+				d := backoff(attempt)
+				if c.OnWait != nil {
+					c.OnWait(d, lastErr)
+				}
 				select {
-				case <-time.After(backoff(attempt)):
+				case <-time.After(d):
 				case <-ctx.Done():
 					out <- Chunk{Err: ctx.Err()}
 					return
@@ -188,8 +197,12 @@ func (c *Client) Stream(ctx context.Context, req Request) <-chan Chunk {
 			}
 			// 429 rate limits need a much longer cool-down than transient errors.
 			if isRateLimit(err) {
+				const rateLimitCooldown = 20 * time.Second
+				if c.OnWait != nil {
+					c.OnWait(rateLimitCooldown, err)
+				}
 				select {
-				case <-time.After(20 * time.Second):
+				case <-time.After(rateLimitCooldown):
 				case <-ctx.Done():
 					out <- Chunk{Err: ctx.Err()}
 					return
@@ -231,6 +244,16 @@ func isRateLimit(err error) bool {
 	}
 	return err != nil && strings.Contains(err.Error(), "429")
 }
+
+// IsRateLimit reports whether err is a provider-side rate limit. It is
+// exported so a caller can explain a twenty-second retry in the user's terms
+// instead of reporting every wait as a generic connection fault.
+func IsRateLimit(err error) bool { return isRateLimit(err) }
+
+// doneMarker is the SSE payload a provider sends to close a stream. It is a
+// sentinel rather than a frame, so it is recognised before anything tries to
+// parse the payload as JSON.
+const doneMarker = "[DONE]"
 
 func (c *Client) doStream(ctx context.Context, req Request) (<-chan Chunk, error) {
 	body, err := json.Marshal(req)
@@ -344,6 +367,24 @@ func (c *Client) doStream(ctx context.Context, req Request) (<-chan Chunk, error
 			case strings.HasPrefix(line, "data:"):
 				data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 				if data == "" {
+					continue
+				}
+				// The end-of-stream sentinel is checked before the JSON
+				// validation below, and it has to be. "[DONE]" is not valid
+				// JSON, so a validator runs first treats it as the first half of a
+				// frame that is still arriving: it is buffered, frame() is never
+				// called, and the sentinel is silently dropped. The turn then ends
+				// on EOF rather than on the provider's own end-of-stream, and a
+				// response that carried nothing but the sentinel is reported as
+				// "stream ended before any data" instead of the empty reply the
+				// provider actually sent.
+				if data == doneMarker {
+					if !frame(doneMarker) {
+						return
+					}
+					if last {
+						return
+					}
 					continue
 				}
 				if partial != "" {

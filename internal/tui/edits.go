@@ -46,13 +46,31 @@ type EditEntry struct {
 	Output string
 	// Seq numbers entries so the newest is known without comparing times.
 	Seq int
-	// Added and Removed are the line counts, computed once at record time
-	// because the diff is the expensive part and the list is re-rendered on
-	// every keystroke.
+	// Added and Removed are the line counts, and Lines is the
+	// context-trimmed change script, all computed once at record time.
+	//
+	// They are cached because computing them is an LCS over the lines that
+	// differ, and both of their consumers are hot: the live diff panel
+	// re-renders on every repaint — twenty times a second, for as long as the
+	// panel is up — and the edit list re-renders on every keystroke. Diffing
+	// the same pair of texts that often is the difference between a panel
+	// that keeps up and one that pins a core.
 	Added   int
 	Removed int
+	// Lines is the context-trimmed diff, shared read-only with the renderer.
+	Lines []editdiff.Line
 	// Rows is the coloured diff body, cached for the same reason.
 	Rows []string
+}
+
+// Change returns the entry's context-trimmed diff, computing it if the entry
+// was built without one. Entries normally arrive from record, which fills
+// Lines in; the fallback keeps a hand-built entry renderable.
+func (e EditEntry) Change() []editdiff.Line {
+	if e.Lines != nil {
+		return e.Lines
+	}
+	return editdiff.Context(e.Before, e.After, editdiff.DefaultContext)
 }
 
 // Stat returns the added/removed counts.
@@ -82,9 +100,14 @@ func newEditLog() *editLog { return &editLog{} }
 
 // record files one tool call's changes, one entry per file, newest last.
 //
-// The rows are rendered here rather than in the overlay: the overlay
-// re-renders on every keystroke, and diffing a large file per keystroke is
-// work thrown away.
+// The change script is computed once, here, and every renderer reads it from
+// the entry. It used to be recomputed per render: the live diff panel renders
+// on every repaint and the edit list on every keystroke, and each of those
+// paid for a full LCS over the two texts. Nothing about the file changes
+// between two renders, so that work was identical every time.
+//
+// diffRows takes the script rather than the texts so the entry is diffed
+// once instead of twice.
 func (l *editLog) record(tool, dur, output string, isErr bool, files []editdiff.FileDiff) {
 	if l == nil || len(files) == 0 {
 		return
@@ -92,7 +115,16 @@ func (l *editLog) record(tool, dur, output string, isErr bool, files []editdiff.
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	for _, f := range files {
-		added, removed := editdiff.Count(f.Before, f.After)
+		lines := editdiff.Context(f.Before, f.After, editdiff.DefaultContext)
+		added, removed := 0, 0
+		for _, ln := range lines {
+			switch ln.Op {
+			case editdiff.OpAdd:
+				added++
+			case editdiff.OpDel:
+				removed++
+			}
+		}
 		if added == 0 && removed == 0 {
 			// The text either side of the change is identical, so there is no
 			// change to list. The tool layer filters this too, but a record is
@@ -101,7 +133,7 @@ func (l *editLog) record(tool, dur, output string, isErr bool, files []editdiff.
 			continue
 		}
 		l.seq++
-		rows := diffRows(f.Path, f.Before, f.After)
+		rows := diffRows(f.Path, lines)
 		l.entries = append(l.entries, EditEntry{
 			Tool:    tool,
 			Path:    f.Path,
@@ -113,6 +145,7 @@ func (l *editLog) record(tool, dur, output string, isErr bool, files []editdiff.
 			Seq:     l.seq,
 			Added:   added,
 			Removed: removed,
+			Lines:   lines,
 			Rows:    rows,
 		})
 	}
@@ -167,10 +200,10 @@ func (l *editLog) clear() {
 	l.mu.Unlock()
 }
 
-// diffRows renders the context-trimmed change for a file, as coloured rows
-// with a line-number gutter.
-func diffRows(path, before, after string) []string {
-	lines := editdiff.Context(before, after, editdiff.DefaultContext)
+// diffRows renders an already-computed change script as coloured rows with a
+// line-number gutter. It takes the script rather than the two texts so a
+// caller that already has it does not pay for a second diff.
+func diffRows(path string, lines []editdiff.Line) []string {
 	out := make([]string, 0, len(lines)+2)
 	out = append(out, theme.Get("").Style("tool", "--- a/"+path))
 	out = append(out, theme.Get("").Style("tool", "+++ b/"+path))
@@ -399,7 +432,7 @@ func statSuffix(pal theme.Palette, s editdiff.Stats) string {
 // three-line window that happens to be all context tells the user nothing.
 func editPreviewRowsFor(pal theme.Palette, e EditEntry, w int) []string {
 	rows := make([]string, 0, editPreviewRows)
-	for _, l := range editdiff.Context(e.Before, e.After, editdiff.DefaultContext) {
+	for _, l := range e.Change() {
 		if l.Op == editdiff.OpEqual {
 			continue
 		}

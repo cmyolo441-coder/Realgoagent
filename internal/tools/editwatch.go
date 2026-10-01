@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 
@@ -72,52 +73,128 @@ func snap(path string) snapshot {
 	return snapshot{existed: true, text: string(b)}
 }
 
-// watchGuard serialises capture around a mutating tool call so two concurrent
-// edits to one file cannot interleave their before/after reads.
-var watchGuard sync.Mutex
+// watchLocks holds one mutex per path, so capture for two different files
+// cannot block each other and a nested call cannot block its own caller.
+var watchLocks struct {
+	mu    sync.Mutex
+	locks map[string]*pathLock
+}
 
-// beginEdit captures the pre-state of every path a call is about to touch.
-// It returns the snapshots keyed by path; pass them to finishEdit.
-func beginEdit(paths []string) map[string]snapshot {
-	watchGuard.Lock()
-	out := make(map[string]snapshot, len(paths))
+// pathLock is a per-path mutex plus a reference count, so a lock can be
+// dropped once nothing is watching the path any more. Without the count the
+// map would grow one entry per file the agent ever wrote, for the life of the
+// process.
+type pathLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// acquirePathLocks locks every path in full, in sorted order, and returns them
+// keyed by path. Sorted order is what keeps two calls touching overlapping
+// sets of files from deadlocking against each other.
+func acquirePathLocks(paths []string) map[string]*pathLock {
+	if len(paths) == 0 {
+		return nil
+	}
+	full := make([]string, 0, len(paths))
+	seen := make(map[string]bool, len(paths))
 	for _, p := range paths {
-		full, err := resolvePath(p)
-		if err != nil {
+		res, err := resolvePath(p)
+		if err != nil || seen[res] {
 			continue
 		}
-		out[full] = snap(full)
+		seen[res] = true
+		full = append(full, res)
+	}
+	sort.Strings(full)
+
+	watchLocks.mu.Lock()
+	if watchLocks.locks == nil {
+		watchLocks.locks = map[string]*pathLock{}
+	}
+	out := make(map[string]*pathLock, len(full))
+	for _, p := range full {
+		l := watchLocks.locks[p]
+		if l == nil {
+			l = &pathLock{}
+			watchLocks.locks[p] = l
+		}
+		l.refs++
+		out[p] = l
+	}
+	watchLocks.mu.Unlock()
+
+	// Lock outside watchLocks.mu: a lock already held by another goroutine can
+	// take a while to free, and the registry must not be blocked on it.
+	for _, p := range full {
+		out[p].mu.Lock()
 	}
 	return out
 }
 
-// finishEdit reads the post-state and reports the change, if any.
-func finishEdit(before map[string]snapshot, tool, dur, output string, isErr bool) {
-	defer watchGuard.Unlock()
-	if len(before) == 0 {
-		return
-	}
-	rec := EditRecord{Tool: tool, Dur: dur, IsErr: isErr, Output: output}
-	for full, pre := range before {
-		post := snap(full)
-		if pre.existed == post.existed && pre.text == post.text {
-			// The call reported success but nothing moved; showing a diff for
-			// an unchanged file would claim work that did not happen.
-			continue
+// releasePathLocks frees the locks acquired by acquirePathLocks and forgets
+// the paths nothing watches any more.
+func releasePathLocks(locks map[string]*pathLock) {
+	watchLocks.mu.Lock()
+	defer watchLocks.mu.Unlock()
+	for p, l := range locks {
+		l.mu.Unlock()
+		if l.refs--; l.refs <= 0 {
+			delete(watchLocks.locks, p)
 		}
-		rec.Files = append(rec.Files, editdiff.FileDiff{
-			Path:   relPath(full),
-			Before: pre.text,
-			After:  post.text,
-		})
 	}
-	if len(rec.Files) == 0 {
-		return
+}
+
+// beginEdit captures the pre-state of every path a call is about to touch.
+// It returns the snapshots keyed by path, plus the locks now held on them;
+// pass both to finishEdit.
+//
+// The lock is per path rather than one global mutex, and it is keyed to the
+// file being edited rather than to the tool call. A single guard held across a
+// tool body is not reentrant: `task` runs a whole subagent, whose own tools
+// come back through here, so the inner call waits on the lock its own caller
+// is holding and the subagent hangs until the session is killed. Per-path
+// locks also stop an unrelated file from blocking behind one being edited.
+func beginEdit(paths []string) (map[string]snapshot, map[string]*pathLock) {
+	locks := acquirePathLocks(paths)
+	out := make(map[string]snapshot, len(locks))
+	for p := range locks {
+		out[p] = snap(p)
 	}
-	// A patch can touch several files, and the diff reads top-down, so order
-	// them by path rather than by map iteration.
-	sortFiles(rec.Files)
-	notifyEdit(rec)
+	return out, locks
+}
+
+// finishEdit reads the post-state, reports the change if there was one, and
+// releases the locks beginEdit took. It releases them even when there is
+// nothing to report, so a call that changed nothing still cannot strand them.
+func finishEdit(before map[string]snapshot, locks map[string]*pathLock, tool, dur, output string, isErr bool) {
+	var rec EditRecord
+	if len(before) > 0 {
+		rec = EditRecord{Tool: tool, Dur: dur, IsErr: isErr, Output: output}
+		for full, pre := range before {
+			post := snap(full)
+			if pre.existed == post.existed && pre.text == post.text {
+				// The call reported success but nothing moved; showing a diff for
+				// an unchanged file would claim work that did not happen.
+				continue
+			}
+			rec.Files = append(rec.Files, editdiff.FileDiff{
+				Path:   relPath(full),
+				Before: pre.text,
+				After:  post.text,
+			})
+		}
+		// A patch can touch several files, and the diff reads top-down, so order
+		// them by path rather than by map iteration.
+		sortFiles(rec.Files)
+	}
+	// Released before notifying: the watcher ends up on the UI bus, and holding
+	// a path lock across that would block every later edit to the same file for
+	// as long as the front-end took to drain.
+	releasePathLocks(locks)
+	if len(rec.Files) > 0 {
+		notifyEdit(rec)
+	}
 }
 
 func sortFiles(fs []editdiff.FileDiff) {

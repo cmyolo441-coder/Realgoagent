@@ -52,8 +52,8 @@ func TestResolveModel(t *testing.T) {
 		t.Errorf("substring resolved to %s", m.ID)
 	}
 
-	// the two models added to kiosai resolve by id and by alias
-	for _, ref := range []string{"longcat-2.5-preview", "longcat", "mimo-v2.6-flash"} {
+	// the models added to kiosai resolve by id and by alias
+	for _, ref := range []string{"longcat-2.5-preview", "longcat", "mimo-v2.6-flash", "atria-dawn-preview", "atria", "qwen3.8-flash-free", "qwen"} {
 		p, m, err := c.ResolveModel(ref)
 		if err != nil {
 			t.Errorf("ResolveModel(%q): %v", ref, err)
@@ -83,6 +83,29 @@ func TestResolveModel(t *testing.T) {
 	}
 }
 
+func TestLoadMergesNewDefaultModels(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	stale := Default()
+	stale.Providers[0].Models = stale.Providers[0].Models[:4]
+	stale.path = path
+	if err := stale.Save(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadFrom(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Providers[0].Models) != 8 {
+		t.Fatalf("stale config should merge to 8 models, got %d", len(got.Providers[0].Models))
+	}
+	for _, ref := range []string{"atria-dawn-preview", "atria", "qwen3.8-flash-free", "qwen"} {
+		if _, _, err := got.ResolveModel(ref); err != nil {
+			t.Errorf("ResolveModel(%q): %v", ref, err)
+		}
+	}
+}
+
 func TestDefaultHasAllProviders(t *testing.T) {
 	c := Default()
 	want := []string{"kiosai", "stepfun"}
@@ -97,9 +120,9 @@ func TestDefaultHasAllProviders(t *testing.T) {
 			t.Errorf("provider %s should be enabled", name)
 		}
 	}
-	// kios models: the original four plus longcat-2.5-preview and mimo-v2.6-flash
-	if len(c.Providers[0].Models) != 6 {
-		t.Errorf("kiosai should have 6 models, got %d", len(c.Providers[0].Models))
+	// kios models: the original four plus longcat-2.5-preview, mimo-v2.6-flash, atria-dawn-preview and qwen3.8-flash-free
+	if len(c.Providers[0].Models) != 8 {
+		t.Errorf("kiosai should have 8 models, got %d", len(c.Providers[0].Models))
 	}
 	for _, m := range c.Providers[0].Models {
 		if m.MaxOut <= 0 {

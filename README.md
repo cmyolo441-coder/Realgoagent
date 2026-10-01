@@ -65,7 +65,7 @@ Preconfigured providers:
 
 | Provider | Models |
 |---|---|
-| kiosai (default) | `grok-4.7-free`, `muse-spark-1.3-contributor`, `deepseek-v4.1-flash-free`, `space-bunny-alpha`, `longcat-2.5-preview`, `mimo-v2.6-flash` |
+| kiosai (default) | `grok-4.7-free`, `muse-spark-1.3-contributor`, `deepseek-v4.1-flash-free`, `space-bunny-alpha`, `longcat-2.5-preview`, `mimo-v2.6-flash`, `atria-dawn-preview`, `qwen3.8-flash-free` |
 | stepfun | `step-5-preview` (1M context) |
 
 Every provider speaks the OpenAI chat-completions wire format. Switch models

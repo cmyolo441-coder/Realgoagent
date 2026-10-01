@@ -186,8 +186,11 @@ func (t *TUI) buildLiveDiffRows(pal theme.Palette, w, budget int, e EditEntry) [
 
 	out := []string{header}
 
-	// Build the diff body
-	diffLines := editdiff.Context(e.Before, e.After, editdiff.DefaultContext)
+	// Build the diff body from the entry's cached script. The panel renders on
+	// every repaint, and the script behind it cannot change while the panel is
+	// up, so diffing again here was twenty LCS computations a second over text
+	// that was already in memory.
+	diffLines := e.Change()
 	if len(diffLines) == 0 {
 		return append(out, pal.Style("dim", "  (no line-level change)"))
 	}
@@ -324,6 +327,7 @@ func formatLiveStreamRow(text string, w int) string {
 	}
 	return p.Style("success", fmt.Sprintf("  + %s", util.Truncate(text, maxLen)))
 }
+
 // formatLiveDiffRow renders a single diff line with color coding.
 // Long lines are truncated to prevent wrapping.
 func formatLiveDiffRow(l editdiff.Line, w int) string {
@@ -500,7 +504,7 @@ func streamStringFieldRaw(raw, key string) (string, bool) {
 			case 'u':
 				if i+4 < len(rest) {
 					var r rune
-					_, _ = fmt.Sscanf(rest[i+1 : i+5], "%04x", &r)
+					_, _ = fmt.Sscanf(rest[i+1:i+5], "%04x", &r)
 					b.WriteRune(r)
 					i += 4
 				}

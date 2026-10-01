@@ -145,21 +145,23 @@ func (r *Registry) Call(ctx context.Context, name string, rawArgs string) (res *
 	// Snapshot the files this call is about to touch so the edit watcher can
 	// show the change the moment it lands. Read-only tools snapshot nothing,
 	// so this costs one map allocation per tool call and nothing else.
-	before := beginEdit(touchPaths(name, rawArgs))
+	//
+	// The returned locks are the caller's to release, and finishEdit is what
+	// releases them. The recover above catches a panicking tool, so the defer
+	// has to run it too: a tool that panicked between begin and finish would
+	// otherwise hold its paths' locks for the rest of the process, and every
+	// later edit to the same file would block behind them. Passing nil releases
+	// whatever is held without reporting a change the tool may never have made.
+	before, locks := beginEdit(touchPaths(name, rawArgs))
 	finished := false
-	// beginEdit takes the watcher's lock and finishEdit is what releases it.
-	// The recover above catches a panicking tool, so without this the lock
-	// would be stranded and every later edit would block in beginEdit for
-	// good: one broken tool turning into a hung session. Passing nil releases
-	// the lock without reporting a change the tool may never have made.
 	defer func() {
 		if !finished {
-			finishEdit(nil, name, "", "", true)
+			finishEdit(nil, locks, name, "", "", true)
 		}
 	}()
 	res = t.Run(ctx, args)
 	res.Duration = time.Since(start)
-	finishEdit(before, name, formatDur(res.Duration), res.Output, res.IsError)
+	finishEdit(before, locks, name, formatDur(res.Duration), res.Output, res.IsError)
 	finished = true
 	return res
 }

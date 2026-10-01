@@ -3,6 +3,7 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/nova-ai/nova/internal/agent"
 	"github.com/nova-ai/nova/internal/config"
@@ -51,6 +52,10 @@ func New(cfg *config.Config, opts *Options) (*App, error) {
 		Workspace: opts.Workspace,
 	})
 
+	// The sink is a no-op here because the interactive path rebinds it to the
+	// UI's bus, and RunOnce installs its own. A nil sink would be a lie about
+	// that: a turn started before either of those would produce no events at
+	// all, which is indistinguishable from an agent that is simply quiet.
 	ag, err := agent.New(agent.Options{
 		Config:    cfg,
 		Provider:  p,
@@ -93,14 +98,31 @@ func (a *App) RunOnce(prompt string) (string, error) {
 	if a.Agent == nil {
 		return "", fmt.Errorf("agent not initialised")
 	}
-	var sb strings.Builder
+	// The sink is called from whichever goroutine the agent emits on, which is
+	// not necessarily this one: a delegated run's events reach the parent's
+	// sink, and a tool that fans out hands the emitter to a worker. Writing to
+	// the builder unguarded is a data race on its slice header, so a delegated
+	// turn could interleave two writes and lose or corrupt the reply rather
+	// than merely reorder it.
+	var (
+		mu sync.Mutex
+		sb strings.Builder
+	)
+	add := func(s string) {
+		if s == "" {
+			return
+		}
+		mu.Lock()
+		sb.WriteString(s)
+		mu.Unlock()
+	}
 	sink := func(ev agent.Event) {
 		switch ev.Kind {
 		case agent.EvText:
-			sb.WriteString(ev.Text)
+			add(ev.Text)
 		case agent.EvToolStart:
 			if !a.Quiet {
-				sb.WriteString("\n[" + ev.Tool + "] " + md.FormatBrief(ev.Tool, ev.Args) + "\n")
+				add("\n[" + ev.Tool + "] " + md.FormatBrief(ev.Tool, ev.Args) + "\n")
 			}
 		case agent.EvToolResult:
 			if !a.Quiet && ev.Output != "" {
@@ -108,15 +130,16 @@ func (a *App) RunOnce(prompt string) (string, error) {
 				if len(out) > 4000 {
 					out = out[:4000] + "\n…"
 				}
-				sb.WriteString(out + "\n")
+				add(out + "\n")
 			}
 		}
 	}
 	a.Agent.SetSink(sink)
-	if err := a.Agent.Run(prompt); err != nil {
-		return sb.String(), err
-	}
-	return sb.String(), nil
+	err := a.Agent.Run(prompt)
+	mu.Lock()
+	out := sb.String()
+	mu.Unlock()
+	return out, err
 }
 
 // Banner renders the startup text for non-interactive use.

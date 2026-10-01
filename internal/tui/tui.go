@@ -384,30 +384,38 @@ func (t *TUI) Submit(text string) error {
 
 // send hands an event to the event loop.
 //
-// Text is the one kind that must never be dropped: EvText carries reply
-// content that also goes into the saved session, so losing one to a full bus
-// would silently truncate the answer and corrupt the conversation on resume.
-// Everything else is a status update, and a dropped frame of those costs
-// nothing but a missing animation tick.
+// Events fall into two classes. A superseded frame — a partial tool call, a
+// reasoning fragment — is replaced by whatever comes next, so dropping one
+// when the bus is full costs nothing: the newest frame says the same thing.
+// Everything else is the only copy of something that will never be re-sent,
+// and is delivered or the turn waits.
+//
+// Two of those matter concretely. EvDone is what releases the UI's working
+// state, so losing it left the spinner running for the rest of the session
+// with no turn in flight to stop it. EvText is the reply itself, and it is
+// also what the session file records, so losing one truncates the answer the
+// user reads while the copy on disk has the whole thing — the two disagree
+// with no indication of which to trust.
+//
+// There is no timeout on the blocking path. A deadline here was a way of
+// trading a stalled front-end for silent data loss, and a front-end can stall
+// legitimately: a long tool result, a terminal catching up on scrollback, a
+// slow repaint while a large diff renders. Blocking is the correct behaviour
+// because the event loop is the only reader and always drains — the agent's
+// goroutine is the one waiting, not the loop — and the done case releases it
+// when the session quits.
 func (t *TUI) send(ev agent.Event) {
-	if ev.Kind != agent.EvText {
+	if ev.Kind == agent.EvToolProgress || ev.Kind == agent.EvThinking {
 		select {
 		case t.messageBus <- ev:
 		default:
+			// Superseded by the next frame; nothing is lost.
 		}
 		return
 	}
-	// Blocking on the bus is safe because the event loop is the only reader
-	// and it is never blocked on the agent: every path that waits on the
-	// agent does so on the agent's own goroutine. The done case keeps a
-	// quitting session from parking this goroutine forever. A timeout guards
-	// against a rare deadlock when the event loop is momentarily blocked
-	// (e.g. a shell command in /run or /diff); dropping a single text frame
-	// is preferable to hanging the agent goroutine forever.
 	select {
 	case t.messageBus <- ev:
 	case <-t.done:
-	case <-time.After(5 * time.Second):
 	}
 }
 
@@ -449,6 +457,12 @@ func (t *TUI) handleEventLocked(ev agent.Event) {
 		}
 	case agent.EvToolDenied:
 		t.app.history.Append(p.Style("warning", "⊘ denied "+ev.Tool))
+		if ev.Text != "" {
+			// A refusal with no reason reads as a tool that silently failed.
+			// This is the same text the model is given, so the user can see
+			// what it is actually being told and why the call stopped.
+			t.app.history.Append(p.Style("dim", "  "+ev.Text))
+		}
 	case agent.EvAskUser:
 		t.startAskLocked(ev.Text)
 	case agent.EvIteration:
@@ -456,6 +470,11 @@ func (t *TUI) handleEventLocked(ev agent.Event) {
 	case agent.EvError:
 		t.flushStream()
 		t.app.history.Append(p.Style("error", "✗ "+ev.Text))
+	case agent.EvModelWait:
+		// The turn is about to go quiet for the length of the wait. Printing
+		// it is the difference between "the model is slow" and "the program
+		// stopped responding", which are not the same thing to the user.
+		t.app.history.Append(p.Style("warning", "⏳ "+ev.Text))
 	case agent.EvReasoningHidden:
 		// Reasoning is stripped before it reaches the screen. Say so once,
 		// rather than letting the user think the model ignored their question.

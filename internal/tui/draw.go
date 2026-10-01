@@ -121,27 +121,27 @@ func (t *TUI) commitHistory(w int) {
 }
 
 // commitHistoryLocked is commitHistory with t.mu held.
+//
+// flushed is an absolute line number, not an index into the buffer. The
+// buffer is capped and drops old lines off the front, so an index stops
+// meaning anything the moment the cap is reached: flushed would sit at
+// len(lines) permanently, `flushed` would equal the length on every pass, and
+// every later line of output would be printed without exception — the
+// transcript would simply stop growing on screen while the session carried
+// on, which reads as a hung program.
 func (t *TUI) commitHistoryLocked(w int) {
-	all := t.app.history.Lines()
-	if len(all) < t.flushed {
-		// The buffer was cleared under us. Forget the old bookkeeping rather
-		// than treating every surviving line as new output.
-		t.flushed = len(all)
-		t.liveLines = 0
-		t.lastFrame = ""
-		return
-	}
-	if len(all) == t.flushed {
+	fresh, _ := t.app.history.Since(t.flushed)
+	if len(fresh) == 0 {
 		return
 	}
 	t.eraseLiveLocked()
-	for _, ln := range all[t.flushed:] {
+	for _, ln := range fresh {
 		line := util.Truncate(ln, w)
 		t.out.WriteString(line)
 		t.out.WriteString("\r\n")
 		t.rowsWritten += util.CountLines(line, w)
 	}
-	t.flushed = len(all)
+	t.flushed += len(fresh)
 	t.lastFrame = ""
 }
 

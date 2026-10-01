@@ -1,0 +1,19 @@
+Hello! This is a test file for the Nova autonomous coding agent.
+
+Nova is a terminal-based AI coding assistant that reads your code, makes edits, runs builds and tests, and reports back what actually happened. It is designed to work in your scrollback so your normal terminal workflow keeps working without any interruptions.
+
+The agent supports multiple AI models from different providers. By default, it uses the kiosai provider with models like grok-4.7-free, deepseek-v4.1-flash-free, and longcat-2.5-preview. You can also configure custom providers by editing the config file at ~/.nova/config/config.json.
+
+Nova comes with a rich set of built-in tools that allow it to read files, write files, edit files, search through code, run shell commands, manage git operations, and even delegate tasks to subagents. The subagent feature is particularly useful for complex investigations that would otherwise clutter the main conversation.
+
+The tool system is extensible, meaning you can add your own custom tools alongside the builtins. This makes Nova adaptable to different workflows and project requirements.
+
+One of the key features of Nova is its edit viewer. Every file that the agent changes is recorded with the text on both sides of the change, and the diff is printed to the transcript the moment it lands. You can review all edits, expand them to see full diffs, and even undo changes if needed.
+
+The interactive mode supports commands like /help, /model, /models, /theme, /status, /config, /tools, /diff, /run, /retry, /compact, and /quit. There are also commands for managing edits and subagents, giving you full control over the agent's behavior.
+
+Nova also supports one-shot mode with the -p flag, which is useful for CI pipelines and scripted tasks. In this mode, the agent runs a single prompt and exits, making it easy to integrate into automated workflows.
+
+Overall, Nova is a powerful and flexible coding assistant that brings the capabilities of modern AI models directly into your terminal, helping you write better code faster and with more confidence.
+
+Edited on 2026-09-28 by the Nova agent.

@@ -504,20 +504,26 @@ func rebuildAgent(t *TUI, p *config.Provider, m *config.Model) error {
 		Workspace: t.app.Workspace,
 		Registry:  reg,
 		PlanMode:  t.app.Mode == ModePlan,
-		EventSink: func(ev agent.Event) {
-			select {
-			case t.messageBus <- ev:
-			default:
-				// drop if the UI is behind; streaming continues
-			}
-		},
+		// The sink goes through the TUI's own send, so it applies the same
+		// drop policy as every other producer on the bus. The inline
+		// non-blocking send it replaces dropped reply text and the end-of-turn
+		// event alike, which truncated answers and stranded the spinner.
+		EventSink: t.send,
 		OnAskUser: func(q string) string {
 			t.mu.Lock()
 			ch := make(chan string, 1)
 			t.pendingAnswer = ch
 			t.mu.Unlock()
-			t.messageBus <- agent.Event{Kind: agent.EvAskUser, Text: q}
-			return <-ch
+			t.send(agent.Event{Kind: agent.EvAskUser, Text: q})
+			select {
+			case answer := <-ch:
+				return answer
+			case <-t.done:
+				// Quitting with a question outstanding: the turn is over, so
+				// unblock the agent rather than leave it parked on a channel
+				// nobody is going to answer.
+				return "(session closed before the question was answered)"
+			}
 		},
 	})
 	if err != nil {

@@ -3,6 +3,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -111,6 +112,28 @@ func (a *Agent) PlanMode() bool {
 	return a.opt.PlanMode
 }
 
+// gitTTL is how long the git context is reused before the branch and the
+// recent log are re-read. Long enough that every iteration of a turn shares
+// one read, short enough that a commit made during a turn is visible on the
+// next one.
+const gitTTL = 30 * time.Second
+
+// sysCacheTTL bounds how long a rendered system prompt is reused. The prompt
+// states the current date and time, so it cannot be cached for the whole
+// session; it also has to pick up an AGENTS.md the user edits while Nova is
+// open. Thirty seconds is far below the notice threshold for either, and long
+// enough that every iteration of a turn shares one rendering.
+const sysCacheTTL = 30 * time.Second
+
+// sysCacheEntry is a memoised system prompt plus the state it was built from.
+// The zero value is never a valid entry.
+type sysCacheEntry struct {
+	valid  bool
+	key    string
+	prompt string
+	stamp  time.Time
+}
+
 // Agent runs the conversation loop.
 type Agent struct {
 	opt      Options
@@ -121,12 +144,29 @@ type Agent struct {
 	totalUsage llm.Usage
 	toolNames  []string
 	cwd        string
-	ctx        context.Context
-	cancel     context.CancelFunc
+	// sysCache memoises the rendered system prompt. Rendering it shells out
+	// to git twice and re-reads every instruction file in the workspace;
+	// doing that per request put roughly 150ms of process startup in front of
+	// every model call, and again for every tool call inside the same turn.
+	// That is what made a reply feel slow to start and slow to continue.
+	sysCache sysCacheEntry
+	// gitStamp/gitContext cache the git status and log for gitTTL, so a turn's
+	// iterations share one read while an agent that commits mid-turn still
+	// sees the new head on the next turn.
+	gitStamp   time.Time
+	gitContext string
+
 	// sinkMu guards opt.EventSink on its own, separate from mu. A sink may
 	// block — on the UI bus, or on the user answering a prompt — so it must
 	// never be invoked with the agent state locked.
 	sinkMu sync.Mutex
+	// ctx and cancel are the running turn's handles.
+	ctx    context.Context
+	cancel context.CancelFunc
+	// onRender is called whenever the system prompt is rendered rather than
+	// served from the cache. It is a test hook: nothing in the product reads
+	// it, and a test uses it to pin how often the expensive path runs.
+	onRender func()
 }
 
 // New constructs an Agent.
@@ -160,16 +200,112 @@ func New(o Options) (*Agent, error) {
 		cwd:       o.Workspace,
 	}
 	a.ctx, a.cancel = context.WithCancel(context.Background())
+	a.setClient(llm.NewClient(o.Provider.BaseURL, o.Provider.APIKeyFromEnv(), o.Model.ID))
 	return a, nil
 }
 
+// setClient installs the transport the agent streams through and subscribes
+// it to this agent's events.
+//
+// The subscription lives here rather than in New because swapping the client
+// is a normal thing to do — a model switch, a test pointing at a stub — and a
+// hook wired only at construction is silently dropped by every one of them.
+func (a *Agent) setClient(c *llm.Client) {
+	// A rate-limited request waits twenty seconds before it is tried again,
+	// and a transient failure up to thirty. The turn produces nothing at all
+	// during that wait, and a front-end with no way to tell a deliberate pause
+	// from a hang has nothing to show but a frozen spinner.
+	c.OnWait = func(d time.Duration, err error) {
+		reason := "connection problem"
+		if isRateLimitErr(err) {
+			reason = "rate limit"
+		}
+		a.emit(Event{Kind: EvModelWait, Text: fmt.Sprintf("%s — retrying in %s", reason, d.Round(time.Second))})
+	}
+	a.mu.Lock()
+	a.client = c
+	a.mu.Unlock()
+}
+
+// streamClient returns the transport the turn should stream through.
+func (a *Agent) streamClient() *llm.Client {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.client
+}
+
+// isRateLimitErr reports whether the client stalled on a provider-side rate
+// limit rather than an ordinary network fault, so the message names the
+// reason instead of guessing.
+func isRateLimitErr(err error) bool { return llm.IsRateLimit(err) }
+
 // SystemPrompt renders the current system prompt.
+//
+// The result is memoised. Rendering it reads the workspace's instruction
+// files and shells out to git twice, and both happen on the request path:
+// buildRequest renders it for every model call, and RunTask renders it again
+// per turn. That put well over a hundred milliseconds of process startup in
+// front of the first token, and again in front of every tool call the model
+// asked for, which is what a user experiences as "slow to start, then slow
+// again after every step".
+//
+// The entry is dropped on a state change rather than invalidated eagerly, so
+// a mode switch or a tool-set change still shows up on the very next request.
 func (a *Agent) SystemPrompt() string {
+	key := a.systemKey()
+	now := time.Now()
+
+	a.mu.Lock()
+	if c := a.sysCache; c.valid && c.key == key && now.Sub(c.stamp) < sysCacheTTL {
+		p := c.prompt
+		a.mu.Unlock()
+		return p
+	}
+	a.mu.Unlock()
+
+	rendered := a.renderSystemPrompt()
+
+	a.mu.Lock()
+	// Another goroutine may have rendered the same prompt meanwhile. The two
+	// renderings differ only in the timestamp, so last writer wins and both
+	// are correct.
+	a.sysCache = sysCacheEntry{valid: true, key: key, prompt: rendered, stamp: time.Now()}
+	a.mu.Unlock()
+	return rendered
+}
+
+// systemKey fingerprints the state the rendered prompt depends on. Two calls
+// that produce the same key must produce the same text, so anything that
+// reaches the prompt belongs here.
+func (a *Agent) systemKey() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return strings.Join([]string{
+		a.opt.Provider.Name,
+		a.opt.Model.ID,
+		a.opt.Workspace,
+		a.cfgShellLocked(),
+		fmt.Sprint(a.opt.PlanMode),
+		strings.Join(a.toolNames, ","),
+	}, "\x00")
+}
+
+// renderSystemPrompt builds the prompt from scratch. Everything slow happens
+// here and nowhere else.
+func (a *Agent) renderSystemPrompt() string {
+	a.mu.Lock()
+	hook := a.onRender
+	a.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+
 	a.mu.Lock()
 	plan := a.opt.PlanMode
 	names := append([]string{}, a.toolNames...)
 	ws := a.opt.Workspace
 	model := a.opt.Provider.Name + "/" + a.opt.Model.ID
+	shell := a.cfgShellLocked()
 	a.mu.Unlock()
 
 	var extra []string
@@ -183,22 +319,56 @@ func (a *Agent) SystemPrompt() string {
 
 	return prompt.Build(prompt.Options{
 		Workspace: ws,
-		Shell:     a.cfgShell(),
+		Shell:     shell,
 		OS:        prompt.RuntimeOS(),
 		Model:     model,
 		Tools:     names,
 		DateTime:  prompt.Now(),
 		Extra:     extra,
-		Git: prompt.GitContext(func(cmd string) string {
-			out, _ := runGit(cmd, ws)
-			return out
-		}),
+		Git:       a.gitContextCached(ws),
 	})
+}
+
+// gitContextCached returns the git status and recent log, spawning git at
+// most once per gitTTL.
+//
+// git status is not free: it walks the worktree, so on a large repository it
+// costs far more than the model call it is attached to. The state it reports
+// is slow-moving compared to a turn, so a short cache keeps the prompt honest
+// while collapsing the per-iteration cost to a single read.
+func (a *Agent) gitContextCached(ws string) string {
+	a.mu.Lock()
+	if !a.gitStamp.IsZero() && time.Since(a.gitStamp) < gitTTL {
+		c := a.gitContext
+		a.mu.Unlock()
+		return c
+	}
+	a.mu.Unlock()
+
+	// Built outside the lock: this runs two subprocesses and must not be
+	// holding a.mu, or Cancel and Messages would block behind it.
+	ctx := prompt.GitContext(func(cmd string) string {
+		out, _ := runGit(cmd, ws)
+		return out
+	})
+
+	a.mu.Lock()
+	a.gitStamp = time.Now()
+	a.gitContext = ctx
+	a.mu.Unlock()
+	return ctx
 }
 
 func (a *Agent) cfgShell() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	return a.cfgShellLocked()
+}
+
+// cfgShellLocked is cfgShell with a.mu already held. systemKey and
+// renderSystemPrompt both call it while they own the lock, and a second Lock
+// on a sync.Mutex deadlocks rather than reading through.
+func (a *Agent) cfgShellLocked() string {
 	if s := a.opt.Config.Shell; s != "" {
 		return s
 	}
@@ -275,6 +445,120 @@ func (a *Agent) InjectHistory(msgs []llm.Message) {
 	a.mu.Unlock()
 }
 
+// historyBudgetTokens is how much of a model's context window the
+// conversation is allowed to occupy. A turn is cut back to fit before it is
+// sent rather than after the provider rejects it, so the failure mode is a
+// shorter context instead of a dead session.
+const historyBudgetTokens = 120000
+
+// trimHistory drops the oldest turns until the conversation fits the budget.
+//
+// It exists because a session's history only ever grows, and a long one used
+// to end with every request refused: each turn appends the model reply and
+// every tool result, and the model call that would have trimmed it cannot
+// happen because the request carrying the too-long history is the one being
+// rejected. The tool schemas and the reply budget take their share of the
+// window first, so only what is left is available to the conversation.
+//
+// Messages are dropped in whole units — a user turn with the reply and tool
+// results that followed it — never one message at a time. An assistant
+// message carrying tool_calls whose results were dropped is a protocol
+// violation the provider rejects, so a lone orphan is worse than a long
+// history. The newest turn is always kept: it is the one being answered, and
+// a turn that cannot fit is reported rather than silently halved.
+func trimHistory(msgs []llm.Message, budget int) ([]llm.Message, bool) {
+	if budget <= 0 || estimateTokens(msgs) <= budget {
+		return msgs, false
+	}
+	// The first message is the system prompt, which the caller re-adds, so the
+	// search for the first user turn starts after it.
+	start := 0
+	for start < len(msgs) && msgs[start].Role == llm.RoleSystem {
+		start++
+	}
+	head := append([]llm.Message{}, msgs[:start]...)
+	body := msgs[start:]
+
+	// Units run from one user message to the next, so each cut removes a
+	// complete exchange.
+	bounds := []int{0}
+	for i, m := range body {
+		if m.Role == llm.RoleUser {
+			bounds = append(bounds, i)
+		}
+	}
+	if len(bounds) < 2 {
+		// A single turn is over budget on its own. There is nothing older to
+		// drop, so the turn goes out as it is and the caller says so.
+		return msgs, true
+	}
+	bounds = append(bounds, len(body))
+
+	keep := len(bounds) - 1
+	for keep > 1 {
+		keep--
+		candidate := append(head, body[bounds[keep]:]...)
+		if estimateTokens(candidate) <= budget {
+			return candidate, true
+		}
+	}
+	last := append(head, body[bounds[len(bounds)-2]:]...)
+	return last, true
+}
+
+// estimateTokens approximates the size of a message list.
+func estimateTokens(msgs []llm.Message) int {
+	est := 0
+	for _, m := range msgs {
+		est += config.EstimateTokens(m.Content) + config.EstimateTokens(m.Name) + 4
+		for _, tc := range m.ToolCalls {
+			est += config.EstimateTokens(tc.Function.Name) +
+				config.EstimateTokens(tc.Function.Arguments) + 8
+		}
+	}
+	return est
+}
+
+// callFingerprint identifies a tool call for the repeat guard: the same tool
+// asked for with the same arguments.
+//
+// The arguments are re-encoded rather than compared as text, because a model
+// re-emitting the same object with different spacing or key order is making
+// the same call, not a new one — comparing raw strings would let a loop that
+// merely reformats its arguments run forever.
+func callFingerprint(name, args string) string {
+	canonical := ""
+	var m map[string]any
+	if err := jsonUnmarshal(args, &m); err == nil && m != nil {
+		if b, err := json.Marshal(m); err == nil {
+			canonical = string(b)
+		}
+	}
+	if canonical == "" {
+		canonical = strings.Join(strings.Fields(args), " ")
+	}
+	return name + "\x00" + canonical
+}
+
+// repeatLimit is how many times the same call may run within one turn. Three
+// covers a genuine retry — a tool that failed, a path that had not been
+// created yet — while stopping a model stuck re-reading the same file from
+// spending the turn's whole budget, and the user's tokens, on it.
+const repeatLimit = 3
+
+// repeatedToolCall counts one call and returns an error naming the loop once
+// the same call has already run repeatLimit times this turn. It returns nil
+// while the count is still within budget, so the tool runs exactly
+// repeatLimit times and the next identical call is the one refused.
+func repeatedToolCall(counts map[string]int, name, args string) error {
+	key := callFingerprint(name, args)
+	counts[key]++
+	if counts[key] <= repeatLimit {
+		return nil
+	}
+	return fmt.Errorf("%s has already run %d times in this turn with identical arguments and is not changing anything; stop repeating it and either do something different or report what you found", name, repeatLimit)
+}
+
 // Run processes one user turn to completion.
 //
 // Every exit path reports EvDone and fires OnDone exactly once. A front-end
@@ -326,6 +610,10 @@ func (a *Agent) RunTask(parent context.Context, userText string) (err error) {
 	start := time.Now()
 	completed := false
 	iterations := 0
+	// One counter per distinct tool call, held for the whole turn rather than
+	// for one iteration: a model stuck re-reading the same file repeats across
+	// iterations, so a counter reset each time would never reach its limit.
+	repeats := make(map[string]int)
 	defer func() {
 		summary := "stopped"
 		if completed {
@@ -350,7 +638,7 @@ func (a *Agent) RunTask(parent context.Context, userText string) (err error) {
 		a.emit(Event{Kind: EvIteration, Text: fmt.Sprintf("%d", iter)})
 
 		req := a.buildRequest()
-		chunks := a.client.Stream(turnCtx, req)
+		chunks := a.streamClient().Stream(turnCtx, req)
 
 		var streamed strings.Builder
 		var toolCalls []llm.ToolCall
@@ -431,7 +719,7 @@ func (a *Agent) RunTask(parent context.Context, userText string) (err error) {
 		// They run with no lock held: a tool can block on an ask_user answer,
 		// and holding a.mu across that would deadlock every other method on the
 		// agent, including Cancel, so Esc could not stop the turn.
-		toolMsgs := a.runToolCalls(turnCtx, toolCalls)
+		toolMsgs := a.runToolCalls(turnCtx, toolCalls, repeats)
 		a.appendMessages(toolMsgs)
 	}
 	a.emit(Event{Kind: EvError, Text: fmt.Sprintf("reached max iterations (%d)", maxIter), IsErr: true})
@@ -478,12 +766,69 @@ func (a *Agent) buildRequest() llm.Request {
 			},
 		})
 	}
+
+	// The conversation is cut to fit the window before the request is built, so
+	// a long session degrades to a shorter context instead of being refused
+	// outright. The trim is written back to the history so the dropped turns
+	// stop being re-sent, and re-counted by the session that persists it.
+	if trimmed, cut := trimHistory(msgs, a.historyBudget(llmTools)); cut {
+		msgs = trimmed
+		a.replaceHistory(trimmed)
+	}
 	return llm.Request{
 		Messages:    msgs,
 		Tools:       llmTools,
 		Temperature: temp,
 		MaxTokens:   a.maxOutputTokens(msgs, llmTools),
 	}
+}
+
+// historyBudget is how many tokens the conversation may occupy on the current
+// model. The window minus the tool schemas, the system prompt and a reserve
+// for the reply, floored at a small floor so a tiny configured window still
+// sends something rather than an empty request.
+func (a *Agent) historyBudget(llmTools []llm.Tool) int {
+	a.mu.Lock()
+	window := a.opt.Model.Context
+	a.mu.Unlock()
+	if window <= 0 {
+		return historyBudgetTokens
+	}
+	reserved := 0
+	for _, t := range llmTools {
+		reserved += config.EstimateTokens(t.Function.Name) +
+			config.EstimateTokens(t.Function.Description) + 8
+		for _, v := range t.Function.Parameters {
+			reserved += config.EstimateTokens(fmt.Sprint(v))
+		}
+	}
+	budget := window - reserved - a.opt.Model.OutputLimit()
+	if budget < 4096 {
+		budget = 4096
+	}
+	return budget
+}
+
+// replaceHistory swaps in a trimmed conversation, keeping the system message
+// the agent holds so the next turn still renders and re-attaches it.
+func (a *Agent) replaceHistory(msgs []llm.Message) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	kept := make([]llm.Message, 0, len(msgs))
+	system := ""
+	for _, m := range msgs {
+		if m.Role == llm.RoleSystem {
+			if system == "" {
+				system = m.Content
+			}
+			continue
+		}
+		kept = append(kept, m)
+	}
+	if system != "" {
+		kept = append([]llm.Message{{Role: llm.RoleSystem, Content: system}}, kept...)
+	}
+	a.messages = kept
 }
 
 // maxOutputTokens sizes max_tokens for the active model — the single place the
@@ -512,8 +857,10 @@ func (a *Agent) maxOutputTokens(msgs []llm.Message, tools []llm.Tool) int {
 
 // runToolCalls executes one batch of tool calls in order. ctx is the running
 // turn's context, passed in rather than read from the field so a concurrent
-// turn cannot swap it out from under the call in flight.
-func (a *Agent) runToolCalls(ctx context.Context, calls []llm.ToolCall) []llm.Message {
+// turn cannot swap it out from under the call in flight. repeats is the turn's
+// per-call counter map, passed in so the guard spans iterations rather than
+// resetting at each one.
+func (a *Agent) runToolCalls(ctx context.Context, calls []llm.ToolCall, repeats map[string]int) []llm.Message {
 	out := make([]llm.Message, 0, len(calls))
 	for _, tc := range calls {
 		args := parseArgs(tc.Function.Arguments)
@@ -554,6 +901,19 @@ func (a *Agent) runToolCalls(ctx context.Context, calls []llm.ToolCall) []llm.Me
 			out = append(out, llm.Message{
 				Role: llm.RoleTool, ToolCallID: tc.ID, Name: tc.Function.Name,
 				Content: fmt.Sprintf("user answered: %s", answer),
+			})
+			continue
+		}
+
+		// A call identical to one already made this turn is refused with the
+		// reason, so the model gets the explanation in its own context and can
+		// act on it. The tool is not run: the point is that running it again
+		// produces the result it has already been given.
+		if err := repeatedToolCall(repeats, tc.Function.Name, tc.Function.Arguments); err != nil {
+			a.emit(Event{Kind: EvToolDenied, Tool: tc.Function.Name, Text: err.Error()})
+			out = append(out, llm.Message{
+				Role: llm.RoleTool, ToolCallID: tc.ID, Name: tc.Function.Name,
+				Content: err.Error(),
 			})
 			continue
 		}

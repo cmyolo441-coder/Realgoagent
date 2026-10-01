@@ -188,6 +188,8 @@ func Default() *Config {
 					{ID: "space-bunny-alpha", Alias: "bunny", Context: 262144, MaxOut: 131072},
 					{ID: "longcat-2.5-preview", Alias: "longcat", Context: 262144, MaxOut: 131072},
 					{ID: "mimo-v2.6-flash", Alias: "mimo", Context: 262144, MaxOut: 131072},
+					{ID: "atria-dawn-preview", Alias: "atria", Context: 262144, MaxOut: 131072},
+					{ID: "qwen3.8-flash-free", Alias: "qwen", Context: 262144, MaxOut: 131072},
 				},
 			},
 			{
@@ -221,6 +223,36 @@ func defaultShell() string {
 	return "/bin/sh"
 }
 
+// mergeDefaultModels appends any default models missing from c, so users with
+// an older saved config still see newly added models (e.g. in /models).
+// Existing entries are never overwritten: match is by case-insensitive model
+// ID, and whole missing providers are appended as-is.
+func mergeDefaultModels(c *Config) {
+	d := Default()
+	for _, dp := range d.Providers {
+		merged := false
+		for i := range c.Providers {
+			if !strings.EqualFold(c.Providers[i].Name, dp.Name) {
+				continue
+			}
+			merged = true
+			have := make(map[string]bool, len(c.Providers[i].Models))
+			for _, m := range c.Providers[i].Models {
+				have[strings.ToLower(m.ID)] = true
+			}
+			for _, dm := range dp.Models {
+				if !have[strings.ToLower(dm.ID)] {
+					c.Providers[i].Models = append(c.Providers[i].Models, dm)
+				}
+			}
+			break
+		}
+		if !merged {
+			c.Providers = append(c.Providers, dp)
+		}
+	}
+}
+
 // Load reads config from an explicit path.
 func LoadFrom(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
@@ -231,6 +263,7 @@ func LoadFrom(path string) (*Config, error) {
 	if err := json.Unmarshal(data, c); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
+	mergeDefaultModels(c)
 	c.path = path
 	return c, nil
 }
@@ -257,6 +290,8 @@ func Load() (*Config, error) {
 	c.path = p
 	if len(c.Providers) == 0 {
 		c.Providers = Default().Providers
+	} else {
+		mergeDefaultModels(c)
 	}
 	if c.MaxIterations <= 0 {
 		c.MaxIterations = 60
