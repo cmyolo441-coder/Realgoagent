@@ -33,12 +33,45 @@ func NewBuffer(max int) *Buffer {
 }
 
 // Append adds one or more lines.
+//
+// The lock is not optional: Append is the only mutator on the type, so leaving
+// it out would mean every other method locks against a writer that ignores the
+// lock entirely, giving the zero mutual exclusion its name promises.
 func (b *Buffer) Append(lines ...string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.lines = append(b.lines, lines...)
 	b.total += len(lines)
-	if len(b.lines) > b.max {
-		b.lines = append([]string{}, b.lines[len(b.lines)-b.max:]...)
+	b.trimLocked()
+}
+
+// trimLocked drops lines off the front so the window does not grow without
+// bound.
+//
+// The copy is done in place rather than into a fresh slice. Reallocating on
+// every append meant that once the window filled, each line the transcript
+// gained cost a brand new 160KB allocation plus 10k string headers copied —
+// garbage proportional to session length, churned on the event-loop goroutine
+// that also has to drain the event bus, so a long session got steadily more
+// sluggish. Sliding the existing array removes the allocation entirely; what
+// remains is a memmove of pointer-sized headers, which is memory bandwidth
+// rather than garbage.
+//
+// Trimming to exactly max, in place and every time, is deliberate: the retained
+// window is a contract. Since derives its absolute base from
+// total-len(lines), so a reader must be able to assume the window never sits
+// above the cap, or "these lines were evicted" stops meaning one thing.
+func (b *Buffer) trimLocked() {
+	if len(b.lines) <= b.max {
+		return
 	}
+	over := len(b.lines) - b.max
+	copy(b.lines, b.lines[over:])
+	// Blank the vacated tail so evicted lines are not kept alive by the array.
+	for i := b.max; i < len(b.lines); i++ {
+		b.lines[i] = ""
+	}
+	b.lines = b.lines[:b.max]
 }
 
 // AppendText splits a block into rendered lines and appends them.
@@ -49,9 +82,7 @@ func (b *Buffer) AppendText(s string) {
 	added := strings.Split(s, "\n")
 	b.lines = append(b.lines, added...)
 	b.total += len(added)
-	if len(b.lines) > b.max {
-		b.lines = append([]string{}, b.lines[len(b.lines)-b.max:]...)
-	}
+	b.trimLocked()
 }
 
 // Lines returns a copy of the retained lines, oldest first.

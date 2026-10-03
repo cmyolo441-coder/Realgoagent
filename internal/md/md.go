@@ -220,11 +220,12 @@ func looksTableish(line string) bool {
 func (r *Renderer) inline(s string) string {
 	p := r.Palette
 
-	// 1. file references with line numbers get accent colour
-	s = reFileRef.ReplaceAllStringFunc(s, func(m string) string {
-		inner := reFileRef.FindStringSubmatch(m)[1]
-		return p.Style("accent2", inner)
-	})
+	// 1. file references with line numbers get accent colour. The submatch is
+	// taken from the callback's own match: re-running FindStringSubmatch on
+	// the same text doubles the scan, and on an 8KB streaming tail re-rendered
+	// twenty times a second that is the difference between keeping up and
+	// falling behind.
+	s = reFileRef.ReplaceAllString(s, p.Style("accent2", "$1"))
 
 	// 2. tokenise code spans so nothing else touches their contents
 	var codes []string
@@ -247,19 +248,12 @@ func (r *Renderer) inline(s string) string {
 	}
 	s = protect(s)
 
-	// 3. images (before links)
-	s = reImage.ReplaceAllStringFunc(s, func(m string) string {
-		sub := reImage.FindStringSubmatch(m)
-		return p.Style("dim", "[img] "+sub[1])
-	})
+	// 3. images (before links); submatches come from the callback's own
+	// groups, never a second scan of the same match.
+	s = reImage.ReplaceAllString(s, p.Style("dim", "[img] $1"))
 	// 4. links
-	s = reLink.ReplaceAllStringFunc(s, func(m string) string {
-		sub := reLink.FindStringSubmatch(m)
-		return p.Style("accent2", sub[1]) + p.Style("dim", " ("+sub[2]+")")
-	})
-	s = reAutoLink.ReplaceAllStringFunc(s, func(m string) string {
-		return p.Style("accent2", m[1:len(m)-1])
-	})
+	s = reLink.ReplaceAllString(s, p.Style("accent2", "$1")+p.Style("dim", " ($2)"))
+	s = reAutoLink.ReplaceAllString(s, p.Style("accent2", "$1"))
 	// 5. emphasis (placeholders contain only digits, so bold/italic/regex safe)
 	s = reBold.ReplaceAllString(s, "\x1b[1m$1\x1b[0m")
 	s = reBoldU.ReplaceAllString(s, "\x1b[1m$1\x1b[0m")

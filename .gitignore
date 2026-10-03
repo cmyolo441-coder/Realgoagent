@@ -1,3 +1,4 @@
 nova
+dist/
 __pycache__/
 *.pyc

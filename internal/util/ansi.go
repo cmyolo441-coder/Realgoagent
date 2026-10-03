@@ -199,41 +199,47 @@ func wrapOne(s string, width int) []string {
 		curW = 0
 	}
 
-	runes := []rune(s)
-	for i := 0; i < len(runes); {
-		r := runes[i]
-		if r == 0x1b {
+	// Walk the string by byte, decoding one rune at a time. The previous
+	// []rune conversion copied the whole (already ANSI-bloated) line before
+	// the loop even started, which doubled the allocation on every wrapped
+	// line of every re-rendered streaming tail.
+	for i := 0; i < len(s); {
+		c := s[i]
+		if c == 0x1b {
 			// capture whole escape into cur and pending
 			start := i
 			i++
-			if i < len(runes) && runes[i] == '[' {
+			if i < len(s) && s[i] == '[' {
 				i++
-				for i < len(runes) {
-					c := runes[i]
+				for i < len(s) {
+					c := s[i]
 					i++
 					if c >= 0x40 && c <= 0x7e {
 						break
 					}
 				}
 			} else {
-				if i < len(runes) {
-					i++
+				if i < len(s) {
+					// decode one rune so a multi-byte short escape is not split
+					_, size := decodeRune(s[i:])
+					i += size
 				}
 			}
-			seq := string(runes[start:i])
+			seq := s[start:i]
 			cur.WriteString(seq)
 			pending.WriteString(seq)
 			ansiBuf = append(ansiBuf, seq...)
 			continue
 		}
+		r, size := decodeRune(s[i:])
 		rw := RuneWidth(r)
 		if curW+rw > width {
 			// try to break at last space
 			flush()
 		}
-		cur.WriteRune(r)
+		cur.WriteString(s[i : i+size])
 		curW += rw
-		i++
+		i += size
 	}
 	if cur.Len() > 0 || len(lines) == 0 {
 		lines = append(lines, strings.TrimRight(cur.String(), " "))
@@ -271,6 +277,19 @@ func Repeat(r rune, n int) string {
 
 // RuneCount is a thin wrapper over utf8 for callers that need it.
 func RuneCount(s string) int { return utf8.RuneCountInString(s) }
+
+// decodeRune decodes one rune from the front of s without allocating. It is
+// utf8.DecodeRuneInString specialised for the wrapper's hot loop.
+func decodeRune(s string) (rune, int) {
+	if len(s) == 0 {
+		return 0, 0
+	}
+	c := s[0]
+	if c < 0x80 {
+		return rune(c), 1
+	}
+	return utf8.DecodeRuneInString(s)
+}
 
 // isCombining reports whether r is a zero-width combining mark.
 func isCombining(r rune) bool {

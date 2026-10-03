@@ -190,6 +190,8 @@ func Default() *Config {
 					{ID: "mimo-v2.6-flash", Alias: "mimo", Context: 262144, MaxOut: 131072},
 					{ID: "atria-dawn-preview", Alias: "atria", Context: 262144, MaxOut: 131072},
 					{ID: "qwen3.8-flash-free", Alias: "qwen", Context: 262144, MaxOut: 131072},
+					{ID: "ling-3.1-flash", Alias: "ling", Context: 262144, MaxOut: 131072},
+					{ID: "fledge-alpha", Alias: "fledge", Context: 262144, MaxOut: 131072},
 				},
 			},
 			{
@@ -354,6 +356,17 @@ func (c *Config) ResolveModel(ref string) (*Provider, *Model, error) {
 	if ref == "" {
 		ref = c.DefaultModel
 	}
+	// bare model id or alias across providers first: model IDs themselves
+	// can contain slashes, so a blind split on "/" would mistake the ID
+	// prefix for a provider name.
+	for i := range c.Providers {
+		if !c.Providers[i].Enabled {
+			continue
+		}
+		if m := c.Providers[i].FindModel(ref); m != nil {
+			return &c.Providers[i], m, nil
+		}
+	}
 	// exact provider/model
 	if i := strings.Index(ref, "/"); i > 0 {
 		pn, mid := ref[:i], ref[i+1:]
@@ -370,15 +383,6 @@ func (c *Config) ResolveModel(ref string) (*Provider, *Model, error) {
 			return nil, nil, fmt.Errorf("model %q not found in provider %q", mid, pn)
 		}
 		return nil, nil, fmt.Errorf("unknown provider %q", pn)
-	}
-	// bare model id or alias across providers
-	for i := range c.Providers {
-		if !c.Providers[i].Enabled {
-			continue
-		}
-		if m := c.Providers[i].FindModel(ref); m != nil {
-			return &c.Providers[i], m, nil
-		}
 	}
 	return nil, nil, fmt.Errorf("unknown model %q", ref)
 }

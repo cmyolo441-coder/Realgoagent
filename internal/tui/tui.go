@@ -505,18 +505,22 @@ func (t *TUI) handleEventLocked(ev agent.Event) {
 // large change would bury the conversation, and the full diff is one keystroke
 // away in /edits. What it must show is the count and the first few lines, so
 // the user sees the agent changing a file the moment it happens.
+//
+// The preview and the counts come from the entries record just filed rather
+// than from the raw texts. record has already run the LCS and cached the
+// script, the counts and the coloured rows; diffing the same pair of texts
+// again here — twice, once for the counts and once for the preview — tripled
+// the cost of every edit for output that was already in memory.
 func (t *TUI) showEdit(ev agent.Event) {
 	if ev.Edit == nil {
 		return
 	}
 	rec := *ev.Edit
-	t.app.edits.record(rec.Tool, rec.Dur, rec.Output, rec.IsErr, rec.Files)
+	entries := t.app.edits.record(rec.Tool, rec.Dur, rec.Output, rec.IsErr, rec.Files)
 	p := t.app.Theme
-	for _, f := range rec.Files {
-		added, removed := editdiff.Count(f.Before, f.After)
-		head := "  " + p.Style("tool", "✎ ") + p.Style("text", f.Path)
-		stat := editdiff.Stats{Added: added, Removed: removed}
-		head += editStat(p, stat)
+	for _, e := range entries {
+		head := "  " + p.Style("tool", "✎ ") + p.Style("text", e.Path)
+		head += editStat(p, e.Stat())
 		if rec.Dur != "" {
 			head += p.Style("dim", "  "+rec.Dur)
 		}
@@ -524,7 +528,7 @@ func (t *TUI) showEdit(ev agent.Event) {
 			head += p.Style("error", "  failed")
 		}
 		t.app.history.Append(head)
-		for _, row := range editPreview(p, f.Path, f.Before, f.After, t.app.Width) {
+		for _, row := range editPreview(p, e, t.app.Width) {
 			t.app.history.Append(row)
 		}
 	}
@@ -545,11 +549,11 @@ func editStat(p theme.Palette, s editdiff.Stats) string {
 // editPreviewLines is how many changed lines the transcript shows for an edit.
 const editPreviewLines = 4
 
-// editPreview renders the first few changed lines of a file.
-func editPreview(p theme.Palette, path, before, after string, width int) []string {
-	lines := editdiff.Context(before, after, editdiff.DefaultContext)
+// editPreview renders the first few changed lines of a recorded edit. It reads
+// the entry's cached change script, so it never re-diffs the file.
+func editPreview(p theme.Palette, e EditEntry, width int) []string {
 	var out []string
-	for _, l := range lines {
+	for _, l := range e.Change() {
 		if l.Op == editdiff.OpEqual {
 			continue
 		}

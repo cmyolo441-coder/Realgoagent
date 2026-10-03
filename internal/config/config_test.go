@@ -53,7 +53,7 @@ func TestResolveModel(t *testing.T) {
 	}
 
 	// the models added to kiosai resolve by id and by alias
-	for _, ref := range []string{"longcat-2.5-preview", "longcat", "mimo-v2.6-flash", "atria-dawn-preview", "atria", "qwen3.8-flash-free", "qwen"} {
+	for _, ref := range []string{"longcat-2.5-preview", "longcat", "mimo-v2.6-flash", "atria-dawn-preview", "atria", "qwen3.8-flash-free", "qwen", "ling-3.1-flash", "ling", "fledge-alpha", "fledge"} {
 		p, m, err := c.ResolveModel(ref)
 		if err != nil {
 			t.Errorf("ResolveModel(%q): %v", ref, err)
@@ -96,10 +96,10 @@ func TestLoadMergesNewDefaultModels(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got.Providers[0].Models) != 8 {
-		t.Fatalf("stale config should merge to 8 models, got %d", len(got.Providers[0].Models))
+	if len(got.Providers[0].Models) != 10 {
+		t.Fatalf("stale config should merge to 10 models, got %d", len(got.Providers[0].Models))
 	}
-	for _, ref := range []string{"atria-dawn-preview", "atria", "qwen3.8-flash-free", "qwen"} {
+	for _, ref := range []string{"atria-dawn-preview", "atria", "qwen3.8-flash-free", "qwen", "ling-3.1-flash", "ling", "fledge-alpha", "fledge"} {
 		if _, _, err := got.ResolveModel(ref); err != nil {
 			t.Errorf("ResolveModel(%q): %v", ref, err)
 		}
@@ -120,9 +120,9 @@ func TestDefaultHasAllProviders(t *testing.T) {
 			t.Errorf("provider %s should be enabled", name)
 		}
 	}
-	// kios models: the original four plus longcat-2.5-preview, mimo-v2.6-flash, atria-dawn-preview and qwen3.8-flash-free
-	if len(c.Providers[0].Models) != 8 {
-		t.Errorf("kiosai should have 8 models, got %d", len(c.Providers[0].Models))
+	// kios models: the original four plus longcat-2.5-preview, mimo-v2.6-flash, atria-dawn-preview, qwen3.8-flash-free, ling-3.1-flash and fledge-alpha
+	if len(c.Providers[0].Models) != 10 {
+		t.Errorf("kiosai should have 10 models, got %d", len(c.Providers[0].Models))
 	}
 	for _, m := range c.Providers[0].Models {
 		if m.MaxOut <= 0 {
@@ -132,6 +132,14 @@ func TestDefaultHasAllProviders(t *testing.T) {
 			t.Errorf("kiosai/%s context %d must exceed its output limit %d",
 				m.ID, m.Context, m.MaxOut)
 		}
+	}
+	// fireworks/ember-1 was removed: it no longer has a provider of its own
+	// and the model does not resolve any more.
+	if _, _, err := c.ResolveModel("fireworks/accounts/fireworks/models/ember-1"); err == nil {
+		t.Error("expected error for removed provider fireworks")
+	}
+	if _, _, err := c.ResolveModel("ember"); err == nil {
+		t.Error("expected error for removed fireworks model ember")
 	}
 }
 

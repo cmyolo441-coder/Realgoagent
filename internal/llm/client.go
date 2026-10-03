@@ -431,14 +431,20 @@ func streamStatus(r *http.Response) string {
 	return fmt.Sprintf("status %d, content-type %s", r.StatusCode, ct)
 }
 
+// streamChunk is the wire shape of one SSE data frame. It is hoisted to
+// package level because parseChunk runs once per streamed token: a struct
+// type declared inside the function forces the compiler to build its implicit
+// descriptor work on every call instead of once.
+type streamChunk struct {
+	Choices []struct {
+		Delta        Delta  `json:"delta"`
+		FinishReason string `json:"finish_reason"`
+	} `json:"choices"`
+	Usage *Usage `json:"usage"`
+}
+
 func parseChunk(data string) (Chunk, error) {
-	var raw struct {
-		Choices []struct {
-			Delta        Delta  `json:"delta"`
-			FinishReason string `json:"finish_reason"`
-		} `json:"choices"`
-		Usage *Usage `json:"usage"`
-	}
+	var raw streamChunk
 	if err := json.Unmarshal([]byte(data), &raw); err != nil {
 		return Chunk{}, err
 	}
@@ -458,12 +464,15 @@ func Collect(ch <-chan Chunk) (Message, *Usage, error) {
 	msg := Message{Role: RoleAssistant}
 	var finish string
 	var usage *Usage
+	// A builder, not +=: content arrives a token at a time, and re-copying
+	// the whole reply per token turns a long answer into a quadratic copy.
+	var content strings.Builder
 	for c := range ch {
 		if c.Err != nil {
 			return msg, usage, c.Err
 		}
 		if c.Delta.Content != "" {
-			msg.Content += c.Delta.Content
+			content.WriteString(c.Delta.Content)
 		}
 		for _, tc := range c.Delta.Tools {
 			mergeToolCall(&msg, tc)
@@ -475,6 +484,7 @@ func Collect(ch <-chan Chunk) (Message, *Usage, error) {
 			usage = c.Usage
 		}
 	}
+	msg.Content = content.String()
 	if finish == "tool_calls" && len(msg.ToolCalls) == 0 {
 		return msg, usage, fmt.Errorf("model requested tool calls but none were streamed")
 	}

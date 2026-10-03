@@ -142,13 +142,11 @@ func (t *TUI) liveDiffRows(pal theme.Palette, w, budget int) []string {
 		return t.buildLiveStreamRows(pal, w, budget)
 	}
 
-	entries := t.editLog().list()
-	if len(entries) == 0 {
+	// Always show the most recent edit
+	latest, ok := t.editLog().latest()
+	if !ok {
 		return nil
 	}
-
-	// Always show the most recent edit
-	latest := entries[len(entries)-1]
 
 	if latest.Seq != v.lastSeq {
 		v.lastSeq = latest.Seq
@@ -369,7 +367,7 @@ func (t *TUI) liveDiffOpen() bool {
 	if t.liveDiff.streaming {
 		return true
 	}
-	return len(t.editLog().list()) > 0
+	return t.editLog().count() > 0
 }
 
 // updateLiveStreamLocked feeds one EvToolProgress frame into the panel. The

@@ -108,12 +108,19 @@ func newEditLog() *editLog { return &editLog{} }
 //
 // diffRows takes the script rather than the texts so the entry is diffed
 // once instead of twice.
-func (l *editLog) record(tool, dur, output string, isErr bool, files []editdiff.FileDiff) {
+//
+// It returns the entries it filed, so the caller that prints the change to the
+// transcript can read the cached script and counts instead of diffing the same
+// pair of texts a second and third time. The returned slice is a copy of the
+// entries as recorded; the cap trim below may drop them from the log, but the
+// caller is rendering the change that just landed and still needs it.
+func (l *editLog) record(tool, dur, output string, isErr bool, files []editdiff.FileDiff) []EditEntry {
 	if l == nil || len(files) == 0 {
-		return
+		return nil
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	var recorded []EditEntry
 	for _, f := range files {
 		lines := editdiff.Context(f.Before, f.After, editdiff.DefaultContext)
 		added, removed := 0, 0
@@ -134,7 +141,7 @@ func (l *editLog) record(tool, dur, output string, isErr bool, files []editdiff.
 		}
 		l.seq++
 		rows := diffRows(f.Path, lines)
-		l.entries = append(l.entries, EditEntry{
+		e := EditEntry{
 			Tool:    tool,
 			Path:    f.Path,
 			Before:  f.Before,
@@ -147,11 +154,14 @@ func (l *editLog) record(tool, dur, output string, isErr bool, files []editdiff.
 			Removed: removed,
 			Lines:   lines,
 			Rows:    rows,
-		})
+		}
+		l.entries = append(l.entries, e)
+		recorded = append(recorded, e)
 	}
 	if n := len(l.entries); n > maxEditRecords {
 		l.entries = append([]EditEntry{}, l.entries[n-maxEditRecords:]...)
 	}
+	return recorded
 }
 
 // list returns a copy of the history, newest last.
@@ -172,6 +182,26 @@ func (l *editLog) count() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return len(l.entries)
+}
+
+// latest returns the most recently recorded edit.
+//
+// The live-diff panel asks for the newest entry on every repaint, and at twenty
+// frames a second copying the whole history to index its last element spent
+// megabytes a second and took the mutex the recording tool goroutine contends
+// for. The entry is returned by value; its diff slices are shared and read-only,
+// exactly as list() shared them, and the log is append-only so a held entry
+// cannot be mutated underneath the reader.
+func (l *editLog) latest() (EditEntry, bool) {
+	if l == nil {
+		return EditEntry{}, false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.entries) == 0 {
+		return EditEntry{}, false
+	}
+	return l.entries[len(l.entries)-1], true
 }
 
 // undo removes the newest entry, because /undo reverted it and the viewer

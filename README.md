@@ -7,12 +7,31 @@ what actually happened.
 Not a full-screen TUI. It renders in your scrollback, so your normal terminal
 workflow — selecting, copying, scrolling, piping — keeps working.
 
-## Build
+## Install
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/cmyolo441-coder/Realgoagent/main/install.sh | sh
+```
+
+Installs into `~/.local/bin` (falls back to `sudo` into `/usr/local/bin` when
+that directory is not writable). Linux and macOS on amd64 or arm64.
+
+| Variable | Meaning |
+|---|---|
+| `NOVA_VERSION` | install a specific tag, e.g. `NOVA_VERSION=v0.1.0` |
+| `NOVA_INSTALL` | install directory, e.g. `NOVA_INSTALL=~/bin` |
+
+Build from source instead:
+
+```bash
+git clone https://github.com/cmyolo441-coder/Realgoagent.git
+cd Realgoagent
 go build -o nova ./cmd/nova
 ./nova
 ```
+
+Release maintainers: `scripts/release.sh <version> --publish` cross-compiles
+every platform into `dist/` and uploads the assets to a GitHub release.
 
 ## Usage
 
@@ -65,7 +84,7 @@ Preconfigured providers:
 
 | Provider | Models |
 |---|---|
-| kiosai (default) | `grok-4.7-free`, `muse-spark-1.3-contributor`, `deepseek-v4.1-flash-free`, `space-bunny-alpha`, `longcat-2.5-preview`, `mimo-v2.6-flash`, `atria-dawn-preview`, `qwen3.8-flash-free` |
+| kiosai (default) | `grok-4.7-free`, `muse-spark-1.3-contributor`, `deepseek-v4.1-flash-free`, `space-bunny-alpha`, `longcat-2.5-preview`, `mimo-v2.6-flash`, `atria-dawn-preview`, `qwen3.8-flash-free`, `ling-3.1-flash`, `fledge-alpha` |
 | stepfun | `step-5-preview` (1M context) |
 
 Every provider speaks the OpenAI chat-completions wire format. Switch models
