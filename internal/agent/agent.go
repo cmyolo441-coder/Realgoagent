@@ -203,14 +203,24 @@ func New(o Options) (*Agent, error) {
 	o.Registry.ReadOnly = o.PlanMode
 	a := &Agent{
 		opt:       o,
-		client:    llm.NewClient(o.Provider.BaseURL, o.Provider.APIKeyFromEnv(), o.Model.ID),
+		client:    newProviderClient(o.Provider, o.Model.ID),
 		messages:  []llm.Message{},
 		toolNames: o.Registry.Names(),
 		cwd:       o.Workspace,
 	}
 	a.ctx, a.cancel = context.WithCancel(context.Background())
-	a.setClient(llm.NewClient(o.Provider.BaseURL, o.Provider.APIKeyFromEnv(), o.Model.ID))
+	a.setClient(newProviderClient(o.Provider, o.Model.ID))
 	return a, nil
+}
+
+// newProviderClient builds an LLM client for the given provider, attaching
+// any provider-specific headers (e.g. Cline's client-identity headers).
+func newProviderClient(p *config.Provider, modelID string) *llm.Client {
+	c := llm.NewClient(p.BaseURL, p.APIKeyFromEnv(), modelID)
+	if strings.EqualFold(p.Name, "cline") {
+		c.ExtraHeaders = llm.ClineHeaders()
+	}
+	return c
 }
 
 // setClient installs the transport the agent streams through and subscribes

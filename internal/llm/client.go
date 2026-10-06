@@ -113,6 +113,9 @@ type Client struct {
 	Model      string
 	HTTP       *http.Client
 	MaxRetries int
+	// ExtraHeaders are sent on every request (e.g. Cline's client-identity
+	// headers). Set via SetExtraHeaders.
+	ExtraHeaders map[string]string
 	// OnRetry is invoked for observability.
 	OnRetry func(attempt int, err error)
 	// OnWait is invoked before a cool-down sleep, with the length of the wait.
@@ -120,6 +123,22 @@ type Client struct {
 	// without this the caller sees nothing at all for that whole time — the
 	// turn simply stops, which is indistinguishable from a hung program.
 	OnWait func(d time.Duration, err error)
+}
+
+// ClineHeaders returns the client-identity headers that Cline's own CLI
+// sends. Cline's API gates its free models (cline-free/*) on these headers —
+// without them the API returns 403 "only available via Cline product
+// surfaces". These header names/values are public knowledge from Cline's
+// open-source CLI (cline/cline on GitHub).
+func ClineHeaders() map[string]string {
+	return map[string]string{
+		"x-client-type":    "cline-cli",
+		"x-client-version": "3.0.61",
+		"x-platform":       "linux",
+		"User-Agent":       "Cline/3.0.61",
+		"HTTP-Referer":     "https://cline.bot",
+		"X-Title":          "Cline",
+	}
 }
 
 // NewClient returns a client with sane defaults.
@@ -282,6 +301,9 @@ func (c *Client) doStream(ctx context.Context, req Request) (<-chan Chunk, error
 	httpReq.Header.Set("Accept", "text/event-stream")
 	if c.APIKey != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+c.APIKey)
+	}
+	for k, v := range c.ExtraHeaders {
+		httpReq.Header.Set(k, v)
 	}
 	resp, err := c.HTTP.Do(httpReq)
 	if err != nil {
