@@ -282,8 +282,76 @@ func (t *TUI) insertText(s string) {
 	t.insertTextLocked(s)
 }
 
+// sanitizeInsert strips terminal control sequences and control characters
+// from inserted text. A paste of terminal output carries raw ANSI escapes;
+// written back to the screen in the next frame the terminal interprets them
+// — ESC[2J clears the display, cursor moves garble the layout — which is why
+// pasting long terminal output made the prompt box go blank. Typed input
+// never reaches here with such bytes (readInput filters them), so this only
+// affects pastes.
+func sanitizeInsert(s string) string {
+	if !strings.ContainsRune(s, 0x1b) && !strings.ContainsFunc(s, isInsertControl) {
+		return s // fast path: plain text
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		c := s[i]
+		if c == 0x1b {
+			// Skip the whole escape sequence: a CSI (up to its final byte),
+			// an OSC (up to BEL or ST), or a short two-byte sequence.
+			i++
+			switch {
+			case i < len(s) && s[i] == '[':
+				i++
+				for i < len(s) && !(s[i] >= 0x40 && s[i] <= 0x7e) {
+					i++
+				}
+				if i < len(s) {
+					i++
+				}
+			case i < len(s) && s[i] == ']':
+				i++
+				for i < len(s) {
+					if s[i] == 0x07 {
+						i++
+						break
+					}
+					if s[i] == 0x1b && i+1 < len(s) && s[i+1] == '\\' {
+						i += 2
+						break
+					}
+					i++
+				}
+			case i < len(s):
+				_, size := utf8.DecodeRuneInString(s[i:])
+				if size < 1 {
+					size = 1
+				}
+				i += size
+			}
+			continue
+		}
+		if isInsertControl(rune(c)) {
+			i++
+			continue
+		}
+		b.WriteByte(c)
+		i++
+	}
+	return b.String()
+}
+
+// isInsertControl reports whether r must not reach the composer. Newlines and
+// tabs are text; everything else below space — including CR and DEL — would
+// either move the terminal cursor or land as garbage when the frame is drawn.
+func isInsertControl(r rune) bool {
+	return (r < 0x20 && r != '\n' && r != '\t') || r == 0x7f
+}
+
 // insertTextLocked is insertText for callers that already hold t.mu.
 func (t *TUI) insertTextLocked(s string) {
+	s = sanitizeInsert(s)
 	if s == "" {
 		return
 	}

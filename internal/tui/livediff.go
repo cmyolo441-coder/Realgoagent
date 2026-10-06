@@ -283,47 +283,62 @@ func (t *TUI) buildLiveStreamRows(pal theme.Palette, w, budget int) []string {
 	out := []string{header}
 
 	body := budget - len(out)
-	lines := streamPreviewLines(v.streamText)
-	more := len(lines) > body
+	// Pull one extra line to learn whether earlier lines exist; the "earlier"
+	// indicator reserves its own row, the way the recorded panel does.
+	lines, total := streamTailLines(v.streamText, body+1)
+	more := total > body
 	if more {
 		body--
 	}
 	if body < 1 {
 		return out
 	}
-	start := 0
+	// The tail pins to the newest lines (auto-follow): the line being written
+	// right now is at the bottom.
 	if len(lines) > body {
-		start = len(lines) - body
+		lines = lines[len(lines)-body:]
 	}
 	v.maxScroll = 0
-	end := start + body
-	if end > len(lines) {
-		end = len(lines)
-	}
-	for _, text := range lines[start:end] {
+	for _, text := range lines {
 		out = append(out, formatLiveStreamRow(text, w))
 	}
 	if more {
-		out = append(out, pal.Style("dim", fmt.Sprintf("  … %d earlier (streaming…)", start)))
+		out = append(out, pal.Style("dim", fmt.Sprintf("  … %d earlier", total-body)))
 	}
 	return out
 }
 
-// streamPreviewLines splits streamed content into display lines. A trailing
-// partial line is kept: it is the line being typed right now.
-func streamPreviewLines(s string) []string {
+// streamTailLines returns up to the last maxLines display lines of s and the
+// total line count, scanning from the end instead of splitting the whole
+// string. The streamed content grows to the full file being written, and
+// splitting all of it on every 50ms frame made large writes visibly slower
+// the longer they streamed. A trailing partial line is kept: it is the line
+// being typed right now.
+func streamTailLines(s string, maxLines int) (lines []string, total int) {
 	if s == "" {
-		return []string{"…"}
+		return []string{"…"}, 1
 	}
 	s = strings.ReplaceAll(s, "\r\n", "\n")
-	lines := strings.Split(s, "\n")
-	if n := len(lines); n > 0 && lines[n-1] == "" {
-		lines = lines[:n-1]
+	// Drop a single trailing newline, matching streamPreviewLines: it does
+	// not start a new display line.
+	s = strings.TrimSuffix(s, "\n")
+	if s == "" {
+		return []string{"…"}, 1
 	}
-	if len(lines) == 0 {
-		return []string{"…"}
+	total = strings.Count(s, "\n") + 1
+	// Walk back maxLines newlines from the end; each LastIndexByte scans
+	// backwards from the previous hit, so the walk costs the tail, not the
+	// whole string.
+	i := len(s)
+	for n := 0; n < maxLines && i > 0; n++ {
+		if j := strings.LastIndexByte(s[:i], '\n'); j >= 0 {
+			i = j
+		} else {
+			i = 0
+		}
 	}
-	return lines
+	tail := strings.TrimPrefix(s[i:], "\n")
+	return strings.Split(tail, "\n"), total
 }
 
 // formatLiveStreamRow renders one streamed line as a pending addition.

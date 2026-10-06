@@ -116,6 +116,69 @@ func TestStreamRowsCache(t *testing.T) {
 	}
 }
 
+// Pasting terminal output that carries raw ANSI escapes must not let those
+// bytes reach the screen: the terminal interprets them on the next frame —
+// ESC[2J clears the display — which is why pasting long terminal output made
+// the prompt box go blank.
+func TestPasteStripsANSI(t *testing.T) {
+	tui := editTUI()
+	tui.mu.Lock()
+	tui.insertTextLocked("\x1b[31mred text\x1b[0m\n\x1b[2Jcleared?\nplain\x07bell")
+	pal := tui.app.Theme
+	got := strings.Join(tui.inputLines, "\n")
+	rows, _, _ := tui.boxRows(pal, 100, 20)
+	tui.mu.Unlock()
+	if strings.Contains(got, "\x1b") {
+		t.Errorf("composer = %q, want no escape sequences", got)
+	}
+	if !strings.Contains(got, "red text") || !strings.Contains(got, "plain") {
+		t.Errorf("composer = %q, want the text without its styling", got)
+	}
+	if strings.Contains(strings.Join(rows, "\n"), "\x1b[31m") {
+		t.Error("rendered box must not contain raw escape sequences")
+	}
+}
+
+// sanitizeInsert leaves plain text untouched, including tabs and newlines,
+// and drops lone carriage returns.
+func TestSanitizeInsert(t *testing.T) {
+	if got := sanitizeInsert("hello\n\tworld"); got != "hello\n\tworld" {
+		t.Errorf("got %q, want it unchanged", got)
+	}
+	if got := sanitizeInsert("a\rb\nc\r\nd"); got != "ab\nc\nd" {
+		t.Errorf("got %q, want CRs dropped", got)
+	}
+	// OSC hyperlink sequence.
+	if got := sanitizeInsert("\x1b]8;;http://x\x07link\x1b]8;;\x07"); got != "link" {
+		t.Errorf("got %q, want just the link text", got)
+	}
+}
+
+// streamTailLines returns the last N lines without splitting the whole
+// string, with the total count for the "earlier" indicator.
+func TestStreamTailLines(t *testing.T) {
+	lines, total := streamTailLines("l1\nl2\nl3\nl4\nl5", 3)
+	if total != 5 {
+		t.Errorf("total = %d, want 5", total)
+	}
+	if len(lines) != 3 || lines[0] != "l3" || lines[2] != "l5" {
+		t.Errorf("lines = %q, want last 3", lines)
+	}
+	// Fewer lines than asked: everything comes back.
+	lines, total = streamTailLines("a\nb", 10)
+	if total != 2 || len(lines) != 2 {
+		t.Errorf("got %q total %d, want both lines", lines, total)
+	}
+	// Trailing newline does not start a new line; partial last line kept.
+	lines, total = streamTailLines("x\ny\npartial", 2)
+	if total != 3 || lines[1] != "partial" {
+		t.Errorf("got %q total %d, want tail with partial line", lines, total)
+	}
+	if lines, _ := streamTailLines("", 3); len(lines) != 1 {
+		t.Errorf("empty input should yield the placeholder, got %q", lines)
+	}
+}
+
 // A mid-stream (truncated) payload must still yield the partial content via
 // the tolerant scan, without paying for a doomed strict parse.
 func TestStreamFieldRawTruncated(t *testing.T) {
