@@ -115,6 +115,18 @@ func (t *TUI) onKey(k string) {
 			return
 		}
 		text := strings.Join(t.inputLines, "\n")
+		if t.streaming {
+			// Refuse before the composer is cleared, so the prompt is not
+			// lost: Esc stops the running turn, then Enter sends it again.
+			// Submit has the same guard for its other callers; the composer
+			// path is checked here because it is the only one that would
+			// otherwise eat what the user typed.
+			p := t.app.Theme
+			t.mu.Unlock()
+			t.app.history.Append(p.Style("dim", "· a turn is already running — esc to stop it, then send again"))
+			t.scheduleDraw()
+			return
+		}
 		t.inputLines = []string{""}
 		t.cursorLine, t.cursorCol = 0, 0
 		t.mu.Unlock()

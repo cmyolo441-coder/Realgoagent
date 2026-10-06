@@ -207,16 +207,33 @@ const maxStreamSource = 8 << 10
 
 // streamRows renders the tail of the reply being streamed right now, capped
 // at budget rows.
+//
+// The markdown render is cached by buffer length: the buffer only grows
+// between flushes, so a frame that arrives with no new token reuses the last
+// render instead of re-parsing up to 8KB of markdown on every 50ms tick. The
+// returned slice is always a fresh copy — drawLocked appends panel rows onto
+// it, which must never write into the cached backing array.
 func (t *TUI) streamRows(p theme.Palette, w, budget int) []string {
 	if !t.streaming || t.streamBuf.Len() == 0 || budget < 1 {
 		return nil
 	}
-	rendered := md.New(p, w).Render(streamTail(t.streamBuf.String(), maxStreamSource))
-	if len(rendered) > budget {
-		rendered = rendered[len(rendered)-budget:]
-		rendered[0] = p.Style("dim", "…")
+	n := t.streamBuf.Len()
+	if t.streamCacheRows == nil || t.streamCacheLen != n || t.streamCacheW != w || t.streamCachePal != p {
+		t.streamCacheRows = md.New(p, w).Render(streamTail(t.streamBuf.String(), maxStreamSource))
+		t.streamCacheLen = n
+		t.streamCacheW = w
+		t.streamCachePal = p
 	}
-	return rendered
+	cached := t.streamCacheRows
+	if len(cached) > budget {
+		out := make([]string, budget)
+		copy(out, cached[len(cached)-budget:])
+		out[0] = p.Style("dim", "…")
+		return out
+	}
+	out := make([]string, len(cached))
+	copy(out, cached)
+	return out
 }
 
 // streamTail returns at most max bytes of s, starting at a line boundary so

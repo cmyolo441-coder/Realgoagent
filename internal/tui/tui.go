@@ -41,6 +41,16 @@ type TUI struct {
 	streamBuf  strings.Builder
 	toolActive string
 	activeTask string
+	// streamCache remembers the last markdown render of the in-flight reply.
+	// draw() runs on a 50ms ticker while streaming, and re-rendering up to 8KB
+	// of markdown — including per-line syntax highlighting — on every tick
+	// cost the better part of a millisecond a frame even when no new token
+	// had arrived. The buffer only grows between flushes, so a render keyed
+	// by its length (and the wrap width) stays valid until it grows again.
+	streamCacheRows []string
+	streamCacheLen  int
+	streamCacheW    int
+	streamCachePal  theme.Palette
 
 	// asking is set while the agent is blocked on an ask_user question, and
 	// the composer is routed to answering it instead of sending a new turn.
@@ -360,10 +370,27 @@ func (t *TUI) printBanner() {
 // keystrokes while the model works.
 func (t *TUI) Submit(text string) error {
 	t.mu.Lock()
+	if t.streaming {
+		// A second submission while a turn is already in flight is refused,
+		// not queued: starting another agent loop here used to spawn a second
+		// Run goroutine, the agent cancelled the previous turn, both turns'
+		// events interleaved on the bus, and the first turn's EvDone reset the
+		// UI state while the second was still running — its reply streamed
+		// into a buffer the screen no longer showed, which is why a prompt
+		// sometimes got no answer at all. Esc stops the running turn; the
+		// prompt can then be sent again.
+		p := t.app.Theme
+		t.mu.Unlock()
+		t.app.history.Append(p.Style("dim", "· a turn is already running — esc to stop it, then send again"))
+		t.scheduleDraw()
+		return nil
+	}
 	t.app.PromptText = text
 	t.streaming = true
 	t.iter = 0
 	t.streamBuf.Reset()
+	t.streamCacheRows = nil
+	t.streamCacheLen = 0
 	// Esc stops the turn through this handle rather than reaching into the
 	// agent, so the key handler stays free of agent plumbing.
 	t.cancelTurn = t.app.Agent.Cancel
@@ -439,7 +466,10 @@ func (t *TUI) handleEventLocked(ev agent.Event) {
 		t.flushStream()
 		t.app.history.Append(toolCall(p, ev.Tool, md.FormatArgs(ev.Tool, ev.Args)))
 		t.toolActive = ev.Tool
-		t.clearLiveStreamLocked()
+		// Freeze, don't clear: the arguments are complete and the tool is
+		// running, so the last streamed frame stays up until the recorded
+		// diff replaces it.
+		t.freezeLiveStreamLocked()
 	case agent.EvToolProgress:
 		t.toolActive = ev.Tool
 		t.updateLiveStreamLocked(streamFrame{Tool: ev.Tool, Output: ev.Output, Text: ev.Text})
@@ -457,6 +487,9 @@ func (t *TUI) handleEventLocked(ev agent.Event) {
 		}
 	case agent.EvToolDenied:
 		t.app.history.Append(p.Style("warning", "⊘ denied "+ev.Tool))
+		// The tool never ran, so a frozen streaming preview of it would be
+		// a lie; drop it.
+		t.clearLiveStreamLocked()
 		if ev.Text != "" {
 			// A refusal with no reason reads as a tool that silently failed.
 			// This is the same text the model is given, so the user can see
@@ -568,6 +601,11 @@ func editPreview(p theme.Palette, e EditEntry, width int) []string {
 // flushStream commits whatever the model has streamed so far to the history
 // buffer, so the next permanent write picks it up.
 func (t *TUI) flushStream() {
+	// The preview cache keys on buffer length, so it has to go whenever the
+	// buffer is reset — otherwise a new turn that happens to reach the same
+	// length would show the previous turn's render.
+	t.streamCacheRows = nil
+	t.streamCacheLen = 0
 	if t.streamBuf.Len() == 0 {
 		return
 	}

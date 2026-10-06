@@ -22,19 +22,24 @@ const maxToolLineWidth = 200
 // a continuation.
 const toolIndent = 4
 
+// toolGutter visually binds a tool's output to its call: the vertical bar
+// groups the block, so with several tools in a row it is obvious which output
+// belongs to which call. Errors get the bar in red.
+const toolGutter = "  │ "
+
 // toolCall renders the line announcing a tool call.
 // brief is the argument summary and must not repeat the tool name.
 func toolCall(p theme.Palette, name, brief string) string {
-	line := p.Style("dim", "  ▸ ") + p.Style("tool", name)
+	line := p.Style("accent", "  ▸ ") + p.Style("tool", name)
 	if brief != "" {
-		line += "  " + p.Style("text", brief)
+		line += p.Style("dim", " · ") + p.Style("text", brief)
 	}
 	return line
 }
 
-// toolResult renders the outcome: a status line, then the output, indented
-// under it. Blank runs are collapsed and long output is summarised rather than
-// scrolled, so the shape of the result stays visible.
+// toolResult renders the outcome: a status line, then the output grouped
+// under it in the gutter. Blank runs are collapsed and long output is
+// summarised rather than scrolled, so the shape of the result stays visible.
 func toolResult(p theme.Palette, name, dur, output string, isErr bool, width int) []string {
 	head := "  " + p.Style("success", "✓")
 	if isErr {
@@ -42,7 +47,7 @@ func toolResult(p theme.Palette, name, dur, output string, isErr bool, width int
 	}
 	head += " " + p.Style("tool", name)
 	if dur != "" {
-		head += p.Style("dim", "  "+dur)
+		head += p.Style("dim", " · "+dur)
 	}
 
 	rows := []string{head}
@@ -50,7 +55,7 @@ func toolResult(p theme.Palette, name, dur, output string, isErr bool, width int
 	return rows
 }
 
-// summariseOutput renders tool output as indented lines, collapsed and capped.
+// summariseOutput renders tool output as guttered lines, collapsed and capped.
 func summariseOutput(p theme.Palette, out string, isErr bool, width int) []string {
 	// Truncate to the terminal, not just to a constant: a line wider than the
 	// screen wraps, and the wrapped half lands under the next line and makes
@@ -68,16 +73,16 @@ func summariseOutput(p theme.Palette, out string, isErr bool, width int) []strin
 		return nil
 	}
 
-	style := p.Style("dim", "    ")
+	gutter := p.Style("dim", toolGutter)
 	if isErr {
-		style = p.Style("error", "    ")
+		gutter = p.Style("error", toolGutter)
 	}
 
 	shown := lines
-	var more string
+	moreCount := 0
 	if len(shown) > maxToolLines {
+		moreCount = len(shown) - maxToolLines
 		shown = shown[:maxToolLines]
-		more = p.Style("dim", "    … "+itoa(len(lines)-maxToolLines)+" more lines")
 	}
 
 	rows := make([]string, 0, len(shown)+1)
@@ -86,10 +91,10 @@ func summariseOutput(p theme.Palette, out string, isErr bool, width int) []strin
 		if ln == "" {
 			continue
 		}
-		rows = append(rows, style+util.Truncate(ln, limit))
+		rows = append(rows, gutter+util.Truncate(ln, limit))
 	}
-	if more != "" {
-		rows = append(rows, more)
+	if moreCount > 0 {
+		rows = append(rows, gutter+p.Style("dim", "… "+itoa(moreCount)+" more lines"))
 	}
 	return rows
 }

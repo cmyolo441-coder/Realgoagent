@@ -60,16 +60,16 @@ func TestToolResultDropsZeroDuration(t *testing.T) {
 	}
 }
 
-// Output is indented under the status line, not appended to it. The old format
-// glued the first output line onto the header with a "──" separator, which ran
-// the line past the terminal width and wrapped.
+// Output is grouped under the status line in the gutter, not appended to it.
+// The old format glued the first output line onto the header with a "──"
+// separator, which ran the line past the terminal width and wrapped.
 func TestToolOutputIsIndentedNotAppended(t *testing.T) {
 	rows := plain(toolResult(theme.Get("nova"), "bash", "1s", "line one\nline two", false, 80))
 	if len(rows) != 3 {
 		t.Fatalf("got %d rows, want 3: %q", len(rows), rows)
 	}
-	if !strings.HasPrefix(rows[1], "    ") {
-		t.Errorf("output row = %q, want it indented", rows[1])
+	if !strings.Contains(rows[1], "│") {
+		t.Errorf("output row = %q, want it in the gutter", rows[1])
 	}
 	for i, r := range rows {
 		if len(r) > 80 {

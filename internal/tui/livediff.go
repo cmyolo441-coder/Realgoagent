@@ -63,6 +63,12 @@ type liveDiffView struct {
 	streamText string
 	streamID   string
 	streaming  bool
+	// streamLive is true while the model's arguments are still arriving and
+	// false once the tool has started executing. The panel keeps showing the
+	// last streamed frame while the tool runs — clearing it the moment the
+	// tool started left a blank gap between "arguments done" and "diff
+	// recorded", exactly when the user is watching for the change.
+	streamLive bool
 }
 
 func newLiveDiffView() *liveDiffView {
@@ -269,7 +275,11 @@ func (t *TUI) buildLiveStreamRows(pal theme.Palette, w, budget int) []string {
 	}
 	header := pal.Style("accent_bold", " LIVE ")
 	header += pal.Style("text", path)
-	header += pal.Style("dim", "  "+tool+" · streaming…")
+	state := "streaming…"
+	if !v.streamLive {
+		state = "running…"
+	}
+	header += pal.Style("dim", "  "+tool+" · "+state)
 	out := []string{header}
 
 	body := budget - len(out)
@@ -395,6 +405,7 @@ func (t *TUI) updateLiveStreamLocked(ev streamFrame) {
 	v.streamPath = path
 	v.streamText = text
 	v.streaming = true
+	v.streamLive = true
 	v.dismissed = false
 }
 
@@ -404,6 +415,20 @@ type streamFrame struct {
 	Tool   string
 	Output string
 	Text   string
+}
+
+// freezeLiveStreamLocked marks the in-flight preview as running rather than
+// streaming. The tool's arguments are complete and it has started executing;
+// the panel keeps the last streamed frame until the recorded EvEdit or
+// EvToolResult takes over, instead of going blank in between.
+//
+// Called with t.mu held, from the event loop.
+func (t *TUI) freezeLiveStreamLocked() {
+	v := t.liveDiff
+	if v == nil {
+		return
+	}
+	v.streamLive = false
 }
 
 // clearLiveStreamLocked drops the in-flight preview. The recorded EvEdit that
@@ -464,10 +489,19 @@ func streamStringField(raw, key string) string {
 // last complete chunk. The second return reports whether the value was
 // complete (closing quote seen).
 func streamStringFieldRaw(raw, key string) (string, bool) {
-	var m map[string]any
-	if err := json.Unmarshal([]byte(raw), &m); err == nil {
-		if s, _ := m[key].(string); s != "" {
-			return s, true
+	// The strict parse is only attempted when the payload looks complete. A
+	// stream delivers the arguments chunk by chunk, so every progress frame
+	// re-parses the whole accumulated text; running a full unmarshal on a
+	// payload that cannot succeed yet makes the per-frame cost quadratic in
+	// the size of the write. It runs on the event-loop goroutine, so a large
+	// file write visibly stalled the UI and starved the frames behind it —
+	// the preview updated in jumps instead of line by line.
+	if strings.HasSuffix(strings.TrimSpace(raw), "}") {
+		var m map[string]any
+		if err := json.Unmarshal([]byte(raw), &m); err == nil {
+			if s, _ := m[key].(string); s != "" {
+				return s, true
+			}
 		}
 	}
 	needle := `"` + key + `"`
