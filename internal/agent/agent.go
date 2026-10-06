@@ -53,19 +53,20 @@ const (
 	EvEdit EventKind = "edit"
 )
 
-// Event is a single update from the agent.
+// Event is a single update from the agent. It is JSON-serializable so cloud
+// sessions can stream events to a remote terminal over SSE.
 type Event struct {
-	Kind   EventKind
-	Text   string
-	Tool   string
-	Args   map[string]any
-	Output string
-	IsErr  bool
-	Dur    time.Duration
-	Usage  *llm.Usage
-	Task   string // for todo tool
+	Kind   EventKind       `json:"kind"`
+	Text   string          `json:"text,omitempty"`
+	Tool   string          `json:"tool,omitempty"`
+	Args   map[string]any  `json:"args,omitempty"`
+	Output string          `json:"output,omitempty"`
+	IsErr  bool            `json:"is_err,omitempty"`
+	Dur    time.Duration   `json:"dur,omitempty"`
+	Usage  *llm.Usage      `json:"usage,omitempty"`
+	Task   string          `json:"task,omitempty"` // for todo tool
 	// Edit carries the before/after text of a file change, set on EvEdit.
-	Edit *tools.EditRecord
+	Edit *tools.EditRecord `json:"edit,omitempty"`
 }
 
 // Options configures an Agent instance.

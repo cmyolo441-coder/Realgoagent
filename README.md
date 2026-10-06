@@ -68,6 +68,45 @@ nova --plan
 | `--no-color` | disable colour |
 | `--models` | list configured models |
 | `--config <path>` | alternate config file |
+| `--cloud` | connect the terminal to a cloud server |
+| `--server <url>` | cloud server address (default `http://localhost:8080`) |
+| `--session <id>` | attach to an existing cloud session |
+| `--token <t>` | cloud server bearer token |
+
+## Cloud mode
+
+Devin-style: the agent runs on a server, your terminal just streams the
+session. Closing the terminal does not stop the session.
+
+```bash
+# terminal 1: start the backend (any machine, even localhost)
+nova serve --addr :8080
+
+# terminal 2: connect
+nova --cloud
+nova --cloud --session abc123   # reattach to a running session
+```
+
+Inside the TUI:
+
+| Command | Meaning |
+|---|---|
+| `/cloud` | move the current session to the cloud |
+| `/handoff [task]` | move to cloud and keep working there (close the terminal freely) |
+| `/pickup` | switch back from cloud to the local agent |
+| `/cloud-sessions` | list sessions on the server |
+
+Environment:
+
+| Variable | Meaning |
+|---|---|
+| `NOVA_CLOUD_SERVER` | default `--server` for `/cloud` and `/handoff` |
+| `NOVA_CLOUD_TOKEN` | default `--token` |
+
+The server clones the repo into its own workspace per session
+(`~/.goagent/cloud/sessions/<id>/workspace`), so the terminal never ships
+files anywhere. Turns are serialized server-wide: sessions stay independent
+and persistent, but only one turn runs at a time.
 | `--max-iterations <n>` | cap the agent loop |
 | `-q` | quiet startup |
 
