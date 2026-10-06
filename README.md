@@ -18,7 +18,7 @@ that directory is not writable). Linux and macOS on amd64 or arm64.
 
 | Variable | Meaning |
 |---|---|
-| `NOVA_VERSION` | install a specific tag, e.g. `NOVA_VERSION=v0.1.0` |
+| `NOVA_VERSION` | install a specific tag, e.g. `NOVA_VERSION=v0.2.0` |
 | `NOVA_INSTALL` | install directory, e.g. `NOVA_INSTALL=~/bin` |
 
 Build from source instead:
