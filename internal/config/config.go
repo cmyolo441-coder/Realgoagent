@@ -179,7 +179,7 @@ func Default() *Config {
 			{
 				Name:    "kiosai",
 				Kind:    "openai",
-				BaseURL: "https://router.kiosapi.com/v1",
+				BaseURL: "https://kiosapi.com/v1",
 				Enabled: true,
 				Models: []Model{
 					{ID: "muse-spark-1.3-contributor", Alias: "muse", Context: 262144, MaxOut: 131072},
@@ -203,20 +203,10 @@ func Default() *Config {
 					{ID: "step-5-preview", Alias: "step", Context: 1000000, MaxOut: 65536, Vision: true},
 				},
 			},
-			{
-				Name:    "cline",
-				Kind:    "openai",
-				BaseURL: "https://api.cline.bot/api/v1",
-				Enabled: true,
-				Models: []Model{
-					{ID: "stealth/pixel-canary", Alias: "pixel", Context: 262144, MaxOut: 131072},
-					{ID: "stealth/space-bunny-alpha", Alias: "sbunny", Context: 1048576, MaxOut: 131072},
-					{ID: "cline-free/deepseek-v4.1-flash", Alias: "cdeepseek", Context: 1048576, MaxOut: 131072},
-					{ID: "cline-free/mimo-v2.6-flash", Alias: "cmimo", Context: 262144, MaxOut: 131072},
-					{ID: "cline-free/muse-spark-1.3-contributor", Alias: "cmuse", Context: 262144, MaxOut: 131072},
-					{ID: "cline-free/gemini-3.8-flash", Alias: "cgemini", Context: 1048576, MaxOut: 65536},
-				},
-			},
+			// NOTE: Cline provider removed — its free models (cline-free/*) are
+			// hard-gated to Cline's own app (403 "only available via Cline
+			// product surfaces") and stealth/* models no longer exist on the
+			// API. The embedded-key plumbing stays in code for future use.
 		},
 		Shell:  defaultShell(),
 		Prompt: PromptConfig{Animation: true, Smooth: true, Mouse: true, Spinner: "braille"},
