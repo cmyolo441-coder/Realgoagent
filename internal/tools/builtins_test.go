@@ -102,6 +102,23 @@ func TestWriteAndEdit(t *testing.T) {
 	}
 }
 
+func TestWriteRejectsCorruptedContent(t *testing.T) {
+	setupWorkspace(t)
+	// null bytes indicate transmission corruption — must fail fast, not
+	// write a corrupt file
+	r := run(t, writeTool{}, map[string]any{"path": "bad.txt", "content": "hello\x00world"})
+	if !r.IsError || !strings.Contains(r.Output, "corrupted") {
+		t.Errorf("write with null byte should fail with corruption error, got: %v %q", r.IsError, r.Output)
+	}
+	// control characters (except \n \r \t) also indicate corruption
+	r = run(t, writeTool{}, map[string]any{"path": "bad2.txt", "content": "hello\x01world"})
+	if !r.IsError || !strings.Contains(r.Output, "corrupted") {
+		t.Errorf("write with control char should fail with corruption error, got: %v %q", r.IsError, r.Output)
+	}
+	// normal content with newlines/tabs must still work
+	mustNoErr(t, run(t, writeTool{}, map[string]any{"path": "ok.txt", "content": "line1\nline2\ttabbed"}))
+}
+
 func TestEditNotFound(t *testing.T) {
 	setupWorkspace(t)
 	// point at a file that does exist but with an absent target string

@@ -30,7 +30,7 @@ const toolGutter = "  │ "
 // toolCall renders the line announcing a tool call.
 // brief is the argument summary and must not repeat the tool name.
 func toolCall(p theme.Palette, name, brief string) string {
-	line := p.Style("accent", "  ▸ ") + p.Style("tool", name)
+	line := p.Style("accent", "  ● ") + p.Style("tool", name)
 	if brief != "" {
 		line += p.Style("dim", " · ") + p.Style("text", brief)
 	}

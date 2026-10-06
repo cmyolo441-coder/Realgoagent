@@ -30,8 +30,8 @@ func TestToolCallIsOneLine(t *testing.T) {
 // A tool with no argument still renders, just without a trailing gap.
 func TestToolCallWithoutArgs(t *testing.T) {
 	got := util.Strip(toolCall(theme.Get("nova"), "list_dir", ""))
-	if strings.TrimSpace(got) != "▸ list_dir" {
-		t.Errorf("tool call = %q, want %q", got, "▸ list_dir")
+	if strings.TrimSpace(got) != "● list_dir" {
+		t.Errorf("tool call = %q, want %q", got, "● list_dir")
 	}
 }
 

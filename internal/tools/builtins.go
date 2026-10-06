@@ -113,6 +113,18 @@ func (writeTool) Run(ctx context.Context, a map[string]any) *Result {
 		// so a model that simply forgot the content loses the file.
 		return errResult("write: 'content' is required (pass an empty string to create an empty file)")
 	}
+	// Detect transmission corruption: null bytes or other control characters
+	// (except \n, \r, \t) indicate the content was mangled in flight.
+	// Fail fast with a clear message instead of writing a corrupt file that
+	// the agent will then have to delete and rewrite.
+	if i := strings.IndexByte(c, 0); i >= 0 {
+		return errResult("write: content corrupted in transmission (null byte at offset %d) — please resend the write tool call", i)
+	}
+	for i := 0; i < len(c); i++ {
+		if b := c[i]; b < 0x20 && b != '\n' && b != '\r' && b != '\t' {
+			return errResult("write: content corrupted in transmission (control byte 0x%02x at offset %d) — please resend the write tool call", b, i)
+		}
+	}
 	full, err := resolvePath(p)
 	if err != nil {
 		return errResult("write: %v", err)
