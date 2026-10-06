@@ -105,11 +105,19 @@ func (t *TUI) onKey(k string) {
 			// already been typed.
 			ch := t.pendingAnswer
 			t.pendingAnswer = nil
+			// In cloud mode there is no local channel: the question came
+			// from the server over SSE, so the answer goes back over HTTP.
+			var cloud *cloudAgent
+			if ca, ok := t.app.Agent.(*cloudAgent); ok {
+				cloud = ca
+			}
 			t.mu.Unlock()
 			// Buffered, so this never parks the key handler. Nil when the
 			// question was raised by something that has since gone away.
 			if ch != nil {
 				ch <- ans
+			} else if cloud != nil {
+				go cloud.answerQuestion(ans)
 			}
 			t.scheduleDraw()
 			return

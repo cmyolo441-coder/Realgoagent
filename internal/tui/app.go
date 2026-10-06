@@ -3,7 +3,9 @@ package tui
 
 import (
 	"github.com/nova-ai/nova/internal/agent"
+	"github.com/nova-ai/nova/internal/cloud"
 	"github.com/nova-ai/nova/internal/config"
+	"github.com/nova-ai/nova/internal/llm"
 	"github.com/nova-ai/nova/internal/session"
 	"github.com/nova-ai/nova/internal/theme"
 	"github.com/nova-ai/nova/internal/tools"
@@ -19,6 +21,20 @@ const (
 	ModePlan
 )
 
+// Agent is the interface the TUI drives. A local *agent.Agent satisfies it
+// directly; cloudAgent proxies a cloud session over HTTP/SSE.
+type Agent interface {
+	Run(prompt string) error
+	Cancel()
+	Reset()
+	SetPlanMode(on bool)
+	SetSink(f func(agent.Event))
+	SystemPrompt() string
+	Messages() []llm.Message
+	Usage() llm.Usage
+	InjectHistory(msgs []llm.Message)
+}
+
 // App wires the TUI to the agent and config.
 type App struct {
 	Cfg       *config.Config
@@ -27,8 +43,16 @@ type App struct {
 	Height    int
 	Mode      Mode
 	Workspace string
-	Agent     *agent.Agent
+	// Agent is the driven agent: a local *agent.Agent, or a cloudAgent
+	// proxying a cloud session. Both satisfy the Agent interface below.
+	Agent     Agent
 	Registry  *tools.Registry
+	// Cloud, when non-nil, makes newTUI wire a cloudAgent proxying the
+	// client's session instead of a local agent.
+	Cloud *cloud.Client
+	// ResumeSession loads a saved session after the agent is built ("last"
+	// for the most recent). Honored by newTUI and InitLocalAgent.
+	ResumeSession string
 
 	// history is the scrollback buffer of rendered lines.
 	history *Buffer

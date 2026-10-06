@@ -300,21 +300,32 @@ func (a *App) RunWithPrompt(prompt string) error {
 // anything, which is right for -p and useless interactively. Re-binding it
 // here gives the session its UI: events flow to the message bus, and ask_user
 // reaches the composer.
+//
+// In cloud mode (app.Cloud != nil) no local agent is built: a cloudAgent
+// proxies the server session instead, and its events arrive over SSE.
 func (a *App) newTUI() (*TUI, error) {
-	if a.Agent == nil {
-		return nil, fmt.Errorf("agent not initialised")
-	}
 	t, err := NewTUI(a.Cfg)
 	if err != nil {
 		return nil, err
 	}
 	t.app = a
 
+	if a.Cloud != nil {
+		t.app.Agent = newCloudAgent(a.Cloud, t.send)
+		return t, nil
+	}
+	if a.Agent == nil {
+		return nil, fmt.Errorf("agent not initialised")
+	}
+
 	p, m, err := a.Cfg.ResolveModel(a.SelectedModel)
 	if err != nil {
 		return nil, fmt.Errorf("no model available: %w", err)
 	}
 	if err := rebuildAgent(t, p, m); err != nil {
+		return nil, err
+	}
+	if err := a.resumeSession(); err != nil {
 		return nil, err
 	}
 	return t, nil

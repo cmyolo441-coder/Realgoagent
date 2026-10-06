@@ -58,6 +58,10 @@ func init() {
 		{"/run", "Run a shell command directly", cmdRun},
 		{"/retry", "Re-send the last prompt", cmdRetry},
 		{"/compact", "Summarise history to free context", cmdCompact},
+		{"/cloud", "Switch to a cloud session (server keeps running)", cmdCloud},
+		{"/handoff", "Move session to cloud, optionally with a task", cmdHandoff},
+		{"/pickup", "Switch back from cloud to local agent", cmdPickup},
+		{"/cloud-sessions", "List cloud sessions on the server", cmdCloudSessions},
 		{"/quit", "Exit nova", cmdQuit},
 	}
 }
