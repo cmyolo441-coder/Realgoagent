@@ -179,7 +179,7 @@ func Default() *Config {
 			{
 				Name:    "kiosai",
 				Kind:    "openai",
-				BaseURL: "https://kiosapi.com/v1",
+				BaseURL: "https://router.kiosapi.com/v1",
 				Enabled: true,
 				Models: []Model{
 					{ID: "muse-spark-1.3-contributor", Alias: "muse", Context: 262144, MaxOut: 131072},
@@ -201,6 +201,20 @@ func Default() *Config {
 				Enabled: true,
 				Models: []Model{
 					{ID: "step-5-preview", Alias: "step", Context: 1000000, MaxOut: 65536, Vision: true},
+				},
+			},
+			{
+				Name:    "cline",
+				Kind:    "openai",
+				BaseURL: "https://api.cline.bot/api/v1",
+				Enabled: true,
+				Models: []Model{
+					{ID: "stealth/pixel-canary", Alias: "pixel", Context: 262144, MaxOut: 131072},
+					{ID: "stealth/space-bunny-alpha", Alias: "sbunny", Context: 1048576, MaxOut: 131072},
+					{ID: "cline-free/deepseek-v4.1-flash", Alias: "cdeepseek", Context: 1048576, MaxOut: 131072},
+					{ID: "cline-free/mimo-v2.6-flash", Alias: "cmimo", Context: 262144, MaxOut: 131072},
+					{ID: "cline-free/muse-spark-1.3-contributor", Alias: "cmuse", Context: 262144, MaxOut: 131072},
+					{ID: "cline-free/gemini-3.8-flash", Alias: "cgemini", Context: 1048576, MaxOut: 65536},
 				},
 			},
 		},
@@ -430,6 +444,29 @@ func (p *Provider) APIKeyFromEnv() string {
 		if v := os.Getenv(env); v != "" {
 			return v
 		}
+	}
+	// Build-time embedded fallback (set via -ldflags "-X ...embeddedKeys...").
+	// Lets release binaries work without any manual key configuration.
+	return embeddedKeyFor(p.Name)
+}
+
+// embeddedAPIKeys holds build-time injected keys, one per provider.
+// Set via: go build -ldflags "-X github.com/nova-ai/nova/internal/config.embeddedKiosAIKey=..."
+// The keys never appear in source; they only exist inside the built binary.
+var (
+	embeddedKiosAIKey  string
+	embeddedStepFunKey string
+	embeddedClineKey   string
+)
+
+func embeddedKeyFor(provider string) string {
+	switch strings.ToLower(provider) {
+	case "kiosai":
+		return embeddedKiosAIKey
+	case "stepfun":
+		return embeddedStepFunKey
+	case "cline":
+		return embeddedClineKey
 	}
 	return ""
 }

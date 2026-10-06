@@ -36,6 +36,14 @@ command -v go >/dev/null 2>&1 || {
 export CGO_ENABLED=0
 export GOFLAGS=-trimpath
 LDFLAGS="-s -w -X main.version=$VERSION"
+# Optional: embed provider API keys so the binary works without manual config.
+# Keys never touch git; they only land in the built binary via -ldflags.
+#   NOVA_KIOSAI_KEY=sk-... NOVA_STEPFUN_KEY=... NOVA_CLINE_KEY=... scripts/release.sh 0.2.2
+for kv in "embeddedKiosAIKey:${NOVA_KIOSAI_KEY:-}" "embeddedStepFunKey:${NOVA_STEPFUN_KEY:-}" "embeddedClineKey:${NOVA_CLINE_KEY:-}"; do
+	key=${kv%%:*}
+	val=${kv#*:}
+	[ -n "$val" ] && LDFLAGS="$LDFLAGS -X github.com/nova-ai/nova/internal/config.$key=$val"
+done
 
 # Windows is not a target: internal/tui uses syscall.SIGWINCH and syscall.Kill,
 # which only exist on Unix. Add it here once tui handles resize signals per-OS.

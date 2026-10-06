@@ -108,7 +108,7 @@ func TestLoadMergesNewDefaultModels(t *testing.T) {
 
 func TestDefaultHasAllProviders(t *testing.T) {
 	c := Default()
-	want := []string{"kiosai", "stepfun"}
+	want := []string{"kiosai", "stepfun", "cline"}
 	if len(c.Providers) != len(want) {
 		t.Fatalf("want %d providers, got %d", len(want), len(c.Providers))
 	}
@@ -244,7 +244,7 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	if back.Theme != "dracula" {
 		t.Errorf("theme = %q", back.Theme)
 	}
-	if len(back.Providers) != 2 {
+	if len(back.Providers) != 3 {
 		t.Errorf("providers = %d", len(back.Providers))
 	}
 }
