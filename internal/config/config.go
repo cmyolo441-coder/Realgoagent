@@ -203,21 +203,6 @@ func Default() *Config {
 					{ID: "step-5-preview", Alias: "step", Context: 1000000, MaxOut: 65536, Vision: true},
 				},
 			},
-			{
-				// Cline's free models require Cline's client-identity headers
-				// (x-client-type: cline-cli etc.) — see llm.ClineHeaders().
-				// Without them the API 403s with "only available via Cline
-				// product surfaces". nova sends them automatically.
-				Name:    "cline",
-				Kind:    "openai",
-				BaseURL: "https://api.cline.bot/api/v1",
-				Enabled: true,
-				Models: []Model{
-					{ID: "cline-free/solar-mini4", Alias: "csolar", Context: 262144, MaxOut: 131072},
-					{ID: "cline-free/mimo-v2.6-flash", Alias: "cmimo", Context: 262144, MaxOut: 131072},
-					{ID: "cline-free/muse-spark-1.3-contributor", Alias: "cmuse", Context: 262144, MaxOut: 131072},
-				},
-			},
 		},
 		Shell:  defaultShell(),
 		Prompt: PromptConfig{Animation: true, Smooth: true, Mouse: true, Spinner: "braille"},
