@@ -314,10 +314,10 @@ func (a *App) newTUI() (*TUI, error) {
 		t.app.Agent = newCloudAgent(a.Cloud, t.send)
 		return t, nil
 	}
-	if a.Agent == nil {
-		return nil, fmt.Errorf("agent not initialised")
-	}
 
+	// Local mode: rebuildAgent creates the agent. No need for it to exist
+	// beforehand — the nil check used to reject a fresh App before the
+	// agent was built, which broke plain `nova`.
 	p, m, err := a.Cfg.ResolveModel(a.SelectedModel)
 	if err != nil {
 		return nil, fmt.Errorf("no model available: %w", err)
