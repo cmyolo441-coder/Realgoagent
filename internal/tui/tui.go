@@ -512,6 +512,19 @@ func (t *TUI) handleEventLocked(ev agent.Event) {
 		// Reasoning is stripped before it reaches the screen. Say so once,
 		// rather than letting the user think the model ignored their question.
 		t.app.history.Append(p.Style("dim", "· "+ev.Text+" chars of model reasoning hidden"))
+	case agent.EvTruncated:
+		// The reply was cut at the model's output limit. Commit what arrived
+		// first so the notice lands after the text, and name the fix: the
+		// model can continue from here on the next turn.
+		t.flushStream()
+		t.app.history.Append(p.Style("dim", "… reply hit the output limit — say \"continue\" to pick up where it stopped"))
+	case agent.EvStreamBroken:
+		// The connection broke mid-reply. Commit the partial text, show the
+		// error, and point at /retry: the prompt is still stored, so
+		// resending it is one command.
+		t.flushStream()
+		t.app.history.Append(p.Style("error", "✗ "+ev.Text))
+		t.app.history.Append(p.Style("dim", "· /retry to resend your prompt"))
 	case agent.EvDone:
 		if reply := t.streamBuf.String(); strings.TrimSpace(reply) != "" {
 			t.app.LastReply = reply

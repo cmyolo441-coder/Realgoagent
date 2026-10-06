@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -103,6 +104,53 @@ func TestStreamWithNoFramesReportsFailure(t *testing.T) {
 	}
 	if err == nil {
 		t.Fatalf("a stream with no frames reported success: %+v", got)
+	}
+}
+
+// A stream that dies after delivering data but without the end-of-stream
+// marker broke mid-reply. Ending the turn silently on it truncated the
+// answer with no explanation, which reads as the model just stopping
+// mid-sentence — so it must surface as an error instead.
+func TestStreamBrokenMidResponseReportsError(t *testing.T) {
+	body := "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"
+	got := streamBody(t, body)
+
+	if text := chunkText(got); text != "partial" {
+		t.Fatalf("streamed text = %q, want the partial reply", text)
+	}
+	var err error
+	for _, ch := range got {
+		if ch.Err != nil {
+			err = ch.Err
+		}
+	}
+	if err == nil {
+		t.Fatalf("a stream broken mid-response reported success: %+v", got)
+	}
+	if !strings.Contains(err.Error(), "mid-response") {
+		t.Errorf("error = %q, want it to name the mid-response break", err)
+	}
+	if !IsStreamBroken(err) {
+		t.Errorf("error = %T, want it identifiable as a stream break", err)
+	}
+	if IsStreamBroken(errors.New("plain")) {
+		t.Error("IsStreamBroken matched a non-break error")
+	}
+}
+
+// A finish_reason ends the stream cleanly even without the [DONE] sentinel:
+// some providers send one instead of the other.
+func TestFinishReasonEndsStreamCleanly(t *testing.T) {
+	body := "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n"
+	got := streamBody(t, body)
+
+	for _, ch := range got {
+		if ch.Err != nil {
+			t.Fatalf("a finish_reason-terminated stream reported %v", ch.Err)
+		}
+	}
+	if text := chunkText(got); text != "hi" {
+		t.Errorf("streamed text = %q, want %q", text, "hi")
 	}
 }
 

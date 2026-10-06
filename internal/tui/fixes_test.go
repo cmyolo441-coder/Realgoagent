@@ -154,6 +154,42 @@ func TestSanitizeInsert(t *testing.T) {
 	}
 }
 
+// A truncated reply names the cause instead of looking like the model just
+// stopped.
+func TestTruncatedNotice(t *testing.T) {
+	tui := editTUI()
+	tui.streaming = true
+	tui.streamBuf.WriteString("cut off")
+	tui.handleEvent(agent.Event{Kind: agent.EvTruncated})
+	lines, _ := tui.app.history.Since(0)
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "cut off") {
+		t.Errorf("history = %q, want the partial reply committed first", joined)
+	}
+	if !strings.Contains(joined, "output limit") {
+		t.Errorf("history = %q, want the truncation notice", joined)
+	}
+}
+
+// A broken stream shows the error and points at /retry.
+func TestStreamBrokenHint(t *testing.T) {
+	tui := editTUI()
+	tui.streaming = true
+	tui.streamBuf.WriteString("partial")
+	tui.handleEvent(agent.Event{Kind: agent.EvStreamBroken, Text: "stream broke off mid-response"})
+	lines, _ := tui.app.history.Since(0)
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "partial") {
+		t.Errorf("history = %q, want the partial reply committed first", joined)
+	}
+	if !strings.Contains(joined, "mid-response") {
+		t.Errorf("history = %q, want the break explained", joined)
+	}
+	if !strings.Contains(joined, "/retry") {
+		t.Errorf("history = %q, want the retry hint", joined)
+	}
+}
+
 // streamTailLines returns the last N lines without splitting the whole
 // string, with the total count for the "earlier" indicator.
 func TestStreamTailLines(t *testing.T) {

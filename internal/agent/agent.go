@@ -39,6 +39,14 @@ const (
 	// still producing them, so the front-end can preview a write line by
 	// line instead of showing the diff only after the tool has run.
 	EvToolProgress EventKind = "tool_progress"
+	// EvTruncated reports that the model stopped because it hit its output
+	// limit, so the UI can say so instead of leaving a cut-off reply
+	// unexplained.
+	EvTruncated EventKind = "truncated"
+	// EvStreamBroken reports that the provider's stream broke off
+	// mid-response. The turn ends, but unlike other errors the prompt is
+	// kept for /retry: the reply was cut by the connection, not the model.
+	EvStreamBroken EventKind = "stream_broken"
 	// EvEdit reports a file change the agent just made, with the text on both
 	// sides of it, so the front-end can show the change as it lands rather
 	// than leaving the user to reconstruct it from a final diff.
@@ -646,16 +654,27 @@ func (a *Agent) RunTask(parent context.Context, userText string) (err error) {
 		// Reasoning arrives inline in the content stream; it is filtered out
 		// here so it never reaches the screen or the saved conversation.
 		think := &ThinkFilter{}
+		finishReason := ""
 
 		for c := range chunks {
 			if c.Err != nil {
 				// A cancelled context means the user pressed Esc, not that
 				// something broke. The deferred handler reports the turn as
 				// stopped; printing an error here would read as a failure.
-				if !errors.Is(c.Err, context.Canceled) {
+				//
+				// A broken stream is reported distinctly from other errors:
+				// the reply was cut by the connection, so the UI offers a
+				// retry of the same prompt instead of a dead end.
+				switch {
+				case llm.IsStreamBroken(c.Err):
+					a.emit(Event{Kind: EvStreamBroken, Text: c.Err.Error()})
+				case !errors.Is(c.Err, context.Canceled):
 					a.emit(Event{Kind: EvError, Text: c.Err.Error(), IsErr: true})
 				}
 				return c.Err
+			}
+			if c.Finish != "" {
+				finishReason = c.Finish
 			}
 			if c.Delta.Content != "" {
 				text := think.Feed(c.Delta.Content)
@@ -689,6 +708,12 @@ func (a *Agent) RunTask(parent context.Context, userText string) (err error) {
 				a.emit(Event{Kind: EvError, Text: cerr.Error(), IsErr: true})
 			}
 			return cerr
+		}
+		// The provider stopped the reply at its output limit. Say so: a
+		// cut-off answer with no explanation reads as the model just
+		// stopping mid-sentence.
+		if finishReason == "length" {
+			a.emit(Event{Kind: EvTruncated})
 		}
 		// A reply that ended mid-reasoning still has to deliver whatever came
 		// before the opening tag.

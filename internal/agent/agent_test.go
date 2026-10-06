@@ -289,3 +289,53 @@ func waitTurnEnd(t *testing.T, done <-chan struct{}) {
 		t.Fatal("the turn did not end after Cancel")
 	}
 }
+
+// A reply cut at the model's output limit must say so: without the notice a
+// truncated answer reads as the model just stopping mid-sentence.
+func TestRunReportsTruncation(t *testing.T) {
+	body := "data: {\"choices\":[{\"delta\":{\"content\":\"cut off\"},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n"
+	ag, events := newTestAgent(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, body)
+	})
+	if err := ag.Run("hi"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	found := false
+	for _, e := range events() {
+		if e.Kind == EvTruncated {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no EvTruncated event emitted; events: %+v", events())
+	}
+}
+
+// A turn whose stream breaks mid-response must end in error, not in a
+// silently truncated reply — and the break is reported distinctly so the UI
+// can offer a retry of the same prompt.
+func TestRunReportsBrokenStream(t *testing.T) {
+	body := "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"
+	ag, events := newTestAgent(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, body)
+		// Close without the end-of-stream marker: the connection broke.
+	})
+	err := ag.Run("hi")
+	if err == nil {
+		t.Fatal("Run reported success on a broken stream")
+	}
+	if !llm.IsStreamBroken(err) {
+		t.Errorf("Run error = %v, want a stream-break error", err)
+	}
+	found := false
+	for _, e := range events() {
+		if e.Kind == EvStreamBroken && strings.Contains(e.Text, "mid-response") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no EvStreamBroken event; events: %+v", events())
+	}
+}

@@ -255,6 +255,20 @@ func IsRateLimit(err error) bool { return isRateLimit(err) }
 // parse the payload as JSON.
 const doneMarker = "[DONE]"
 
+// streamBrokenError reports a stream that broke off mid-response: data
+// arrived but the provider never sent its end-of-stream marker, so the turn
+// would otherwise end silently on a truncated reply. It is typed so the
+// agent can tell a broken stream from any other failure and offer a retry.
+type streamBrokenError struct{ msg string }
+
+func (e *streamBrokenError) Error() string { return e.msg }
+
+// IsStreamBroken reports whether err is a mid-response stream break.
+func IsStreamBroken(err error) bool {
+	var target *streamBrokenError
+	return errors.As(err, &target)
+}
+
 func (c *Client) doStream(ctx context.Context, req Request) (<-chan Chunk, error) {
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -310,6 +324,27 @@ func (c *Client) doStream(ctx context.Context, req Request) (<-chan Chunk, error
 		var partial string
 		delivered := false
 		sawDone := false
+		// sawFinish tracks a finish_reason on any chunk. Some providers end
+		// the stream with finish_reason instead of the [DONE] sentinel; that
+		// is a clean end, not a break.
+		sawFinish := false
+
+		// abruptEnd reports how an EOF-terminated stream ended. A stream that
+		// delivered data but never sent its end-of-stream marker died
+		// mid-reply — without this the turn ended silently on a truncated
+		// reply, which reads as the model just stopping mid-sentence.
+		abruptEnd := func() {
+			switch {
+			case delivered && !sawDone && !sawFinish:
+				send(Chunk{Err: &streamBrokenError{msg: "stream broke off mid-response (the provider never sent its end-of-stream marker)"}})
+			case !delivered && !sawDone:
+				// Nothing left to read. A 200 that carried no frame at all
+				// is a failed response, not an empty reply: reporting it as
+				// success would end the turn silently with no text and no
+				// error for the user to see.
+				send(Chunk{Err: fmt.Errorf("stream ended before any data (%s)", streamStatus(httpResp))})
+			}
+		}
 
 		// frame handles one complete event payload.
 		frame := func(data string) bool {
@@ -325,6 +360,9 @@ func (c *Client) doStream(ctx context.Context, req Request) (<-chan Chunk, error
 			chunk.Raw = event + ":" + data
 			event = ""
 			delivered = true
+			if chunk.Finish != "" {
+				sawFinish = true
+			}
 			if !send(chunk) {
 				return false
 			}
@@ -342,13 +380,7 @@ func (c *Client) doStream(ctx context.Context, req Request) (<-chan Chunk, error
 					return
 				}
 				if line == "" {
-					// Nothing left to read. A 200 that carried no frame at all
-					// is a failed response, not an empty reply: reporting it as
-					// success would end the turn silently with no text and no
-					// error for the user to see.
-					if !delivered && !sawDone {
-						send(Chunk{Err: fmt.Errorf("stream ended before any data (%s)", streamStatus(httpResp))})
-					}
+					abruptEnd()
 					return
 				}
 			}
@@ -414,6 +446,9 @@ func (c *Client) doStream(ctx context.Context, req Request) (<-chan Chunk, error
 				}
 			}
 			if last {
+				// The final bytes were a frame, not the terminator: the
+				// provider ended without its end-of-stream marker.
+				abruptEnd()
 				return
 			}
 		}
