@@ -282,6 +282,27 @@ type streamBrokenError struct{ msg string }
 
 func (e *streamBrokenError) Error() string { return e.msg }
 
+// isTransportBreak reports whether err is a transport-level stream failure
+// (HTTP/2 stream error, connection reset, broken pipe) as opposed to an
+// application-level problem. These mean the provider killed the connection
+// mid-response.
+func isTransportBreak(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, s := range []string{
+		"stream error", "internal_error", "connection reset",
+		"broken pipe", "unexpected eof", "connection refused",
+		"no route to host", "network is unreachable",
+	} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
+}
+
 // IsStreamBroken reports whether err is a mid-response stream break.
 func IsStreamBroken(err error) bool {
 	var target *streamBrokenError
@@ -398,7 +419,15 @@ func (c *Client) doStream(ctx context.Context, req Request) (<-chan Chunk, error
 			last := rerr != nil
 			if last {
 				if rerr != io.EOF {
-					send(Chunk{Err: rerr})
+					// Transport-level break (HTTP/2 INTERNAL_ERROR, connection
+					// reset, etc.): the provider killed the stream mid-response.
+					// Report it as a broken stream so the agent offers /retry
+					// instead of surfacing a raw protocol error.
+					if isTransportBreak(rerr) {
+						send(Chunk{Err: &streamBrokenError{msg: fmt.Sprintf("stream broke off mid-response (%v)", rerr)}})
+					} else {
+						send(Chunk{Err: rerr})
+					}
 					return
 				}
 				if line == "" {

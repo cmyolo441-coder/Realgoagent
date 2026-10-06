@@ -258,6 +258,21 @@ func (t *TUI) buildLiveDiffRows(pal theme.Palette, w, budget int, e EditEntry) [
 	return out
 }
 
+// liveCountLines counts lines in s without a full split (the streamed
+// content grows large; this scans once).
+func liveCountLines(s string) int {
+	if s == "" {
+		return 0
+	}
+	n := 1
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\n' {
+			n++
+		}
+	}
+	return n
+}
+
 // buildLiveStreamRows renders the write still arriving from the model. The
 // streamed content is diffed against the file on disk, so each new line the
 // model produces appears as a green row the moment its chunk lands. The tail
@@ -273,13 +288,16 @@ func (t *TUI) buildLiveStreamRows(pal theme.Palette, w, budget int) []string {
 	if path == "" {
 		path = "…"
 	}
-	header := pal.Style("accent_bold", " LIVE ")
+	// Advanced live header: pulsing LIVE badge, file path, tool, state, and
+	// real-time line count so the user sees progress as code streams in.
+	lineCount := liveCountLines(v.streamText)
+	header := pal.Style("accent_bold", " ● LIVE ")
 	header += pal.Style("text", path)
-	state := "streaming…"
+	state := "streaming"
 	if !v.streamLive {
-		state = "running…"
+		state = "running"
 	}
-	header += pal.Style("dim", "  "+tool+" · "+state)
+	header += pal.Style("dim", fmt.Sprintf("  %s · %s · %d lines", tool, state, lineCount))
 	out := []string{header}
 
 	body := budget - len(out)

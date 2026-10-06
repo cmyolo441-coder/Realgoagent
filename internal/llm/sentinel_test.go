@@ -138,6 +138,31 @@ func TestStreamBrokenMidResponseReportsError(t *testing.T) {
 	}
 }
 
+func TestIsTransportBreak(t *testing.T) {
+	for _, msg := range []string{
+		"stream error: stream ID 9; INTERNAL_ERROR; received from peer",
+		"read: connection reset by peer",
+		"write: broken pipe",
+		"unexpected EOF",
+	} {
+		if !isTransportBreak(errors.New(msg)) {
+			t.Errorf("isTransportBreak(%q) = false, want true", msg)
+		}
+	}
+	for _, msg := range []string{
+		"plain error",
+		"invalid JSON",
+		"unauthorized",
+	} {
+		if isTransportBreak(errors.New(msg)) {
+			t.Errorf("isTransportBreak(%q) = true, want false", msg)
+		}
+	}
+	if isTransportBreak(nil) {
+		t.Error("isTransportBreak(nil) = true, want false")
+	}
+}
+
 // A finish_reason ends the stream cleanly even without the [DONE] sentinel:
 // some providers send one instead of the other.
 func TestFinishReasonEndsStreamCleanly(t *testing.T) {
