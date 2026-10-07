@@ -185,6 +185,7 @@ func Default() *Config {
 					{ID: "muse-spark-1.3-contributor", Alias: "muse", Context: 262144, MaxOut: 131072},
 					{ID: "grok-4.7-free", Alias: "grok", Context: 262144, MaxOut: 131072, Reasoner: true},
 					{ID: "deepseek-v4.1-flash-free", Alias: "deepseek", Context: 131072, MaxOut: 65536},
+					{ID: "claude-opus-4-8-free", Alias: "opus", Context: 262144, MaxOut: 131072, Reasoner: true},
 					{ID: "space-bunny-alpha", Alias: "bunny", Context: 262144, MaxOut: 131072},
 					{ID: "longcat-2.5-preview", Alias: "longcat", Context: 262144, MaxOut: 131072},
 					{ID: "mimo-v2.6-flash", Alias: "mimo", Context: 262144, MaxOut: 131072},

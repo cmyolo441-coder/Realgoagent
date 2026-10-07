@@ -96,8 +96,8 @@ func TestLoadMergesNewDefaultModels(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got.Providers[0].Models) != 10 {
-		t.Fatalf("stale config should merge to 10 models, got %d", len(got.Providers[0].Models))
+	if len(got.Providers[0].Models) != 11 {
+		t.Fatalf("stale config should merge to 11 models, got %d", len(got.Providers[0].Models))
 	}
 	for _, ref := range []string{"atria-dawn-preview", "atria", "qwen3.8-flash-free", "qwen", "ling-3.1-flash", "ling", "fledge-alpha", "fledge"} {
 		if _, _, err := got.ResolveModel(ref); err != nil {
@@ -121,8 +121,8 @@ func TestDefaultHasAllProviders(t *testing.T) {
 		}
 	}
 	// kios models: the original four plus longcat-2.5-preview, mimo-v2.6-flash, atria-dawn-preview, qwen3.8-flash-free, ling-3.1-flash and fledge-alpha
-	if len(c.Providers[0].Models) != 10 {
-		t.Errorf("kiosai should have 10 models, got %d", len(c.Providers[0].Models))
+	if len(c.Providers[0].Models) != 11 {
+		t.Errorf("kiosai should have 11 models, got %d", len(c.Providers[0].Models))
 	}
 	for _, m := range c.Providers[0].Models {
 		if m.MaxOut <= 0 {
